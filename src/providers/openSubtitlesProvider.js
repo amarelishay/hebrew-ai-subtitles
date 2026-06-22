@@ -1,15 +1,16 @@
 'use strict';
 
 // Thin client for the OpenSubtitles REST API v1 (api.opensubtitles.com).
-// Only searches for and downloads subtitle files that OpenSubtitles itself
-// serves - no scraping, no torrents, no video of any kind.
+// It prefers English subtitles, but can also return the safest subtitle in any
+// available language because the downstream LLM can translate non-English text.
+// No scraping, no torrents, no video of any kind.
 
 const logger = require('../utils/logger');
 const tmdbProvider = require('./tmdbProvider');
 
 const BASE_URL = 'https://api.opensubtitles.com/api/v1';
 const USER_AGENT = 'HebrewAISubtitles v0.1.0';
-const TOKEN_TTL_MS = 23 * 60 * 60 * 1000; // OpenSubtitles JWTs last ~24h
+const TOKEN_TTL_MS = 23 * 60 * 60 * 1000;
 const DEFAULT_MAX_SEARCH_STRATEGIES = 4;
 const RATE_LIMIT_COOLDOWN_MS = 10 * 60 * 1000;
 
@@ -46,7 +47,9 @@ function isAggressiveFallbackEnabled() {
 function assertNotInRateLimitCooldown() {
   if (Date.now() < rateLimitedUntil) {
     const waitSeconds = Math.ceil((rateLimitedUntil - Date.now()) / 1000);
-    throw new OpenSubtitlesRateLimitError(`OpenSubtitles rate limit cooldown active. Try again in ${waitSeconds}s.`);
+    throw new OpenSubtitlesRateLimitError(
+      `OpenSubtitles rate limit cooldown active. Try again in ${waitSeconds}s.`
+    );
   }
 }
 
@@ -65,6 +68,7 @@ function baseHeaders() {
 async function parseJsonResponse(res, context) {
   const text = await res.text();
   let json;
+
   try {
     json = text ? JSON.parse(text) : {};
   } catch (err) {
@@ -92,31 +96,39 @@ async function parseJsonResponse(res, context) {
 async function login() {
   const username = process.env.OPENSUBTITLES_USERNAME;
   const password = process.env.OPENSUBTITLES_PASSWORD;
+
   if (!username || !password) {
     return null;
   }
+
   if (cachedToken && Date.now() - cachedTokenAt < TOKEN_TTL_MS) {
     return cachedToken;
   }
 
   try {
     assertNotInRateLimitCooldown();
+
     const res = await fetch(`${BASE_URL}/login`, {
       method: 'POST',
       headers: baseHeaders(),
       body: JSON.stringify({ username, password }),
     });
+
     const json = await parseJsonResponse(res, 'OpenSubtitles login');
+
     cachedToken = json.token || null;
     cachedTokenAt = Date.now();
+
     if (cachedToken) {
       logger.info('Logged in to OpenSubtitles.');
     }
+
     return cachedToken;
   } catch (err) {
     if (err instanceof OpenSubtitlesRateLimitError || err.code === 'OPENSUBTITLES_RATE_LIMIT') {
       throw err;
     }
+
     logger.warn(`OpenSubtitles login failed, continuing without it: ${err.message}`);
     cachedToken = null;
     return null;
@@ -126,10 +138,23 @@ async function login() {
 async function authHeaders() {
   const token = await login();
   const headers = baseHeaders();
+  delete headers['Content-Type'];
+
   if (token) {
     headers.Authorization = `Bearer ${token}`;
   }
+
   return headers;
+}
+
+function languageCodeForOpenSubtitles(language) {
+  if (!language) return null;
+  const normalized = String(language).trim().toLowerCase();
+
+  if (['en', 'eng', 'english'].includes(normalized)) return 'en';
+  if (['he', 'heb', 'hebrew'].includes(normalized)) return 'he';
+
+  return normalized;
 }
 
 function removeTrailingMediaExtension(value) {
@@ -175,9 +200,39 @@ function containsAllTokens(searchable, tokens) {
 
 function seasonEpisodeCode(season, episode) {
   if (season == null || episode == null) return null;
-  const s = String(season).padStart(2, '0');
-  const e = String(episode).padStart(2, '0');
+
+  const seasonNum = parseInt(season, 10);
+  const episodeNum = parseInt(episode, 10);
+
+  if (!Number.isFinite(seasonNum) || !Number.isFinite(episodeNum)) {
+    return null;
+  }
+
+  const s = String(seasonNum).padStart(2, '0');
+  const e = String(episodeNum).padStart(2, '0');
+
   return `s${s}e${e}`;
+}
+
+function seasonEpisodeCodes(season, episode) {
+  const compactCode = seasonEpisodeCode(season, episode);
+  if (!compactCode) return [];
+
+  const seasonNum = parseInt(season, 10);
+  const episodeNum = parseInt(episode, 10);
+  const s2 = String(seasonNum).padStart(2, '0');
+  const e2 = String(episodeNum).padStart(2, '0');
+
+  return [
+    compactCode,
+    `s${s2} e${e2}`,
+    `${seasonNum}x${e2}`,
+    `${seasonNum}x${episodeNum}`,
+  ];
+}
+
+function searchableHasSeasonEpisode(searchable, season, episode) {
+  return seasonEpisodeCodes(season, episode).some((code) => searchable.includes(code));
 }
 
 function cleanEpisodeTitle(value) {
@@ -186,7 +241,10 @@ function cleanEpisodeTitle(value) {
   const cleaned = removeTrailingMediaExtension(value)
     .replace(/\([^)]*\)/g, ' ')
     .replace(/\[[^\]]*\]/g, ' ')
-    .replace(/\b(\d{3,4}p|x26[45]|h\.?26[45]|web[- ]?dl|web[- ]?rip|bluray|brrip|hdtv|aac|av1|edge\d*|proper|repack)\b.*$/i, ' ')
+    .replace(
+      /\b(\d{3,4}p|x26[45]|h\.?26[45]|web[- ]?dl|web[- ]?rip|bluray|brrip|hdtv|aac|av1|edge\d*|proper|repack)\b.*$/i,
+      ' '
+    )
     .replace(/[\s\-_.]+$/g, '')
     .replace(/^[\s\-_.]+/g, '')
     .replace(/\s+/g, ' ')
@@ -199,15 +257,22 @@ function extractFilenameParts(filename) {
   if (!filename) return {};
 
   const withoutExt = stripExtension(filename);
-  const seasonEpisodeMatch = withoutExt.match(/\bS\s*(\d{1,2})\s*E\s*(\d{1,3})\b/i)
-    || withoutExt.match(/\b(\d{1,2})x(\d{1,3})\b/i);
+
+  const seasonEpisodeMatch =
+    withoutExt.match(/\bS\s*(\d{1,2})\s*E\s*(\d{1,3})\b/i) ||
+    withoutExt.match(/\b(\d{1,2})x(\d{1,3})\b/i);
 
   let showTitle = null;
   let episodeTitle = null;
 
   if (seasonEpisodeMatch) {
-    const before = withoutExt.slice(0, seasonEpisodeMatch.index).replace(/[\s\-]+$/g, '').trim();
-    const after = withoutExt.slice(seasonEpisodeMatch.index + seasonEpisodeMatch[0].length)
+    const before = withoutExt
+      .slice(0, seasonEpisodeMatch.index)
+      .replace(/[\s\-]+$/g, '')
+      .trim();
+
+    const after = withoutExt
+      .slice(seasonEpisodeMatch.index + seasonEpisodeMatch[0].length)
       .replace(/^[\s\-]+/g, '')
       .trim();
 
@@ -231,6 +296,7 @@ function searchableText(item) {
   const attrs = item.attributes || {};
   const feature = attrs.feature_details || {};
   const file = attrs.files && attrs.files[0];
+
   return normalizeTitleToken([
     attrs.release,
     attrs.uploader && attrs.uploader.name,
@@ -242,28 +308,35 @@ function searchableText(item) {
   ].filter(Boolean).join(' '));
 }
 
+function isExactStrategy(label) {
+  return label === 'exact-imdb' || label === 'episode-imdb' || label === 'video-hash';
+}
+
 function isSafeFallbackCandidate(item, context = {}) {
   const label = context.strategyLabel || '';
 
-  if (label === 'exact-imdb' || label === 'episode-imdb' || label === 'video-hash') return true;
+  if (isExactStrategy(label)) {
+    return true;
+  }
 
   const searchable = searchableText(item);
   const showTokens = significantTokens(context.showTitle);
   const episodeTokens = significantTokens(context.episodeTitle);
-  const seCode = seasonEpisodeCode(context.season, context.episode);
-  const filenameSeCode = seasonEpisodeCode(context.filenameSeason, context.filenameEpisode);
 
   if (showTokens.length && !containsAllTokens(searchable, showTokens)) {
     return false;
   }
 
-  if (episodeTokens.length && !containsAllTokens(searchable, episodeTokens)) {
-    return false;
-  }
+  const hasEpisodeTitleMatch = episodeTokens.length
+    ? containsAllTokens(searchable, episodeTokens)
+    : false;
 
-  if (!episodeTokens.length && (seCode || filenameSeCode)) {
-    const expectedCode = seCode || filenameSeCode;
-    if (!searchable.includes(expectedCode)) return false;
+  const hasSeasonEpisodeMatch =
+    searchableHasSeasonEpisode(searchable, context.season, context.episode) ||
+    searchableHasSeasonEpisode(searchable, context.filenameSeason, context.filenameEpisode);
+
+  if (episodeTokens.length || context.season != null || context.filenameSeason != null) {
+    return hasEpisodeTitleMatch || hasSeasonEpisodeMatch;
   }
 
   return true;
@@ -275,9 +348,23 @@ function scoreResult(item, context = {}) {
 
   let score = (attrs.from_trusted ? 1000000 : 0) + (attrs.download_count || 0);
 
+  if (context.preferredLanguage) {
+    const lang = String(attrs.language || '').toLowerCase();
+    if (lang === context.preferredLanguage || lang.startsWith(context.preferredLanguage)) {
+      score += 500000;
+    }
+  }
+
   if (context.filename) {
     const wanted = normalizeTitleToken(context.filename);
     if (wanted && searchable.includes(wanted)) score += 50000;
+  }
+
+  if (
+    searchableHasSeasonEpisode(searchable, context.season, context.episode) ||
+    searchableHasSeasonEpisode(searchable, context.filenameSeason, context.filenameEpisode)
+  ) {
+    score += 40000;
   }
 
   if (context.showTitle) {
@@ -316,36 +403,50 @@ function bestSubtitleFromResults(results, context = {}) {
   const sorted = [...safeResults].sort(
     (a, b) => scoreResult(b, context) - scoreResult(a, context) || String(a.id).localeCompare(String(b.id))
   );
+
   const best = sorted[0];
   const file = best.attributes && best.attributes.files && best.attributes.files[0];
+
   if (!file) return null;
 
   return {
     provider: 'opensubtitles',
     fileId: file.file_id,
     subtitleId: best.id,
-    language: (best.attributes && best.attributes.language) || 'en',
+    language: (best.attributes && best.attributes.language) || 'unknown',
     releaseName: (best.attributes && best.attributes.release) || file.file_name || '',
   };
 }
 
 async function searchOpenSubtitles(params, context = {}) {
   assertNotInRateLimitCooldown();
+
   const headers = await authHeaders();
-  delete headers['Content-Type'];
 
   logger.info(`Searching OpenSubtitles: ${params.toString()}`);
+
   const res = await fetch(`${BASE_URL}/subtitles?${params.toString()}`, { headers });
   const json = await parseJsonResponse(res, 'OpenSubtitles search');
 
   const results = Array.isArray(json.data) ? json.data : [];
+
   logger.info(`OpenSubtitles returned ${results.length} result(s).`);
+
   return bestSubtitleFromResults(results, context);
 }
 
-function exactParams({ imdbId, season, episode, type }) {
+function setLanguageParam(params, language) {
+  const code = languageCodeForOpenSubtitles(language);
+  if (code) {
+    params.set('languages', code);
+  }
+  return params;
+}
+
+function exactParams({ imdbId, season, episode, type, language }) {
   const numericImdbId = String(imdbId).replace(/^tt/i, '');
-  const params = new URLSearchParams({ languages: 'en' });
+  const params = new URLSearchParams();
+  setLanguageParam(params, language);
 
   if (type === 'series' && season != null && episode != null) {
     params.set('parent_imdb_id', numericImdbId);
@@ -358,19 +459,18 @@ function exactParams({ imdbId, season, episode, type }) {
   return params;
 }
 
-function imdbIdParams(imdbId) {
+function imdbIdParams(imdbId, language) {
   if (!imdbId) return null;
   const numericImdbId = String(imdbId).replace(/^tt/i, '');
-  return new URLSearchParams({ languages: 'en', imdb_id: numericImdbId });
+  const params = new URLSearchParams({ imdb_id: numericImdbId });
+  return setLanguageParam(params, language);
 }
 
-function movieHashParams(extra = {}) {
+function movieHashParams(extra = {}, language) {
   if (!extra.videoHash) return null;
 
-  const params = new URLSearchParams({
-    languages: 'en',
-    moviehash: String(extra.videoHash),
-  });
+  const params = new URLSearchParams({ moviehash: String(extra.videoHash) });
+  setLanguageParam(params, language);
 
   if (extra.videoSize) {
     params.set('moviebytesize', String(extra.videoSize));
@@ -379,78 +479,132 @@ function movieHashParams(extra = {}) {
   return params;
 }
 
-function queryParams(query, { season, episode } = {}) {
+function queryParams(query, { language, season, episode } = {}) {
   if (!query || !query.trim()) return null;
 
-  const params = new URLSearchParams({ languages: 'en', query: query.trim() });
+  const params = new URLSearchParams({ query: query.trim() });
+  setLanguageParam(params, language);
+
   if (season != null) params.set('season_number', String(season));
   if (episode != null) params.set('episode_number', String(episode));
+
   return params;
 }
 
 function addUniqueStrategy(strategies, label, params) {
   if (!params) return;
+
   const key = params.toString();
+
   if (!key || strategies.some((s) => s.key === key)) return;
+
   strategies.push({ label, params, key });
 }
 
-function addTitleFallbacks(strategies, filenameParts, metadata) {
-  const showTitle = (metadata && (metadata.showTitle || metadata.originalShowTitle)) || filenameParts.showTitle;
-  const episodeTitle = (metadata && metadata.episodeTitle) || filenameParts.episodeTitle;
+function addTitleFallbacks(strategies, filenameParts, metadata, season, episode, language) {
+  const showTitle =
+    (metadata && (metadata.showTitle || metadata.originalShowTitle)) ||
+    filenameParts.showTitle;
 
-  if (showTitle && episodeTitle) {
-    addUniqueStrategy(strategies, 'show-plus-episode-title-query', queryParams(`${showTitle} ${episodeTitle}`));
+  const episodeTitle =
+    (metadata && metadata.episodeTitle) ||
+    filenameParts.episodeTitle;
+
+  const effectiveSeason = filenameParts.filenameSeason || season;
+  const effectiveEpisode = filenameParts.filenameEpisode || episode;
+  const seCompact = seasonEpisodeCode(effectiveSeason, effectiveEpisode);
+
+  if (showTitle && seCompact) {
+    addUniqueStrategy(
+      strategies,
+      'show-plus-season-episode-query',
+      queryParams(`${showTitle} ${seCompact.toUpperCase()}`, { language })
+    );
   }
 
-  if (metadata && metadata.originalShowTitle && metadata.episodeTitle && metadata.originalShowTitle !== metadata.showTitle) {
+  if (showTitle && episodeTitle) {
+    addUniqueStrategy(
+      strategies,
+      'show-plus-episode-title-query',
+      queryParams(`${showTitle} ${episodeTitle}`, { language })
+    );
+  }
+
+  if (
+    metadata &&
+    metadata.originalShowTitle &&
+    metadata.episodeTitle &&
+    metadata.originalShowTitle !== metadata.showTitle
+  ) {
     addUniqueStrategy(
       strategies,
       'original-show-plus-episode-title-query',
-      queryParams(`${metadata.originalShowTitle} ${metadata.episodeTitle}`)
+      queryParams(`${metadata.originalShowTitle} ${metadata.episodeTitle}`, { language })
     );
   }
 
   if (episodeTitle) {
-    addUniqueStrategy(strategies, 'episode-title-query', queryParams(episodeTitle));
+    addUniqueStrategy(strategies, 'episode-title-query', queryParams(episodeTitle, { language }));
   }
 }
 
-async function buildSearchStrategies({ imdbId, season, episode, type, extra = {} }) {
+async function buildSearchStrategies({ imdbId, season, episode, type, extra = {}, language = 'en' }) {
   const filenameParts = extractFilenameParts(extra.filename);
+
   const metadata = type === 'series'
     ? await tmdbProvider.getEpisodeMetadata({ imdbId, season, episode })
     : null;
 
   const strategies = [];
 
-  addUniqueStrategy(strategies, 'video-hash', movieHashParams(extra));
+  addUniqueStrategy(strategies, 'video-hash', movieHashParams(extra, language));
 
   if (metadata && metadata.episodeImdbId) {
-    addUniqueStrategy(strategies, 'episode-imdb', imdbIdParams(metadata.episodeImdbId));
+    addUniqueStrategy(strategies, 'episode-imdb', imdbIdParams(metadata.episodeImdbId, language));
   }
 
-  addUniqueStrategy(strategies, 'exact-imdb', exactParams({ imdbId, season, episode, type }));
-  addTitleFallbacks(strategies, filenameParts, metadata);
+  addUniqueStrategy(strategies, 'exact-imdb', exactParams({ imdbId, season, episode, type, language }));
+
+  addTitleFallbacks(strategies, filenameParts, metadata, season, episode, language);
 
   if (!metadata && filenameParts.filename && type !== 'series') {
-    addUniqueStrategy(strategies, 'filename-query', queryParams(filenameParts.filename));
+    addUniqueStrategy(strategies, 'filename-query', queryParams(filenameParts.filename, { language }));
   }
 
   if (isAggressiveFallbackEnabled() && type === 'series' && season != null && episode != null) {
     for (const offset of [-1, 1]) {
       const altSeason = season + offset;
+
       if (altSeason > 0) {
-        addUniqueStrategy(strategies, `nearby-season-${altSeason}`, exactParams({ imdbId, season: altSeason, episode, type }));
+        addUniqueStrategy(
+          strategies,
+          `nearby-season-${altSeason}`,
+          exactParams({ imdbId, season: altSeason, episode, type, language })
+        );
       }
     }
   }
 
-  return { strategies: strategies.slice(0, getMaxSearchStrategies()), filenameParts, metadata };
+  return {
+    strategies: strategies.slice(0, getMaxSearchStrategies()),
+    filenameParts,
+    metadata,
+  };
 }
 
-async function findEnglishSubtitle({ imdbId, season, episode, type, extra = {} }) {
-  const { strategies, filenameParts, metadata } = await buildSearchStrategies({ imdbId, season, episode, type, extra });
+async function findSourceSubtitle({ imdbId, season, episode, type, extra = {}, language = 'en' }) {
+  const languageCode = languageCodeForOpenSubtitles(language);
+  const languageLabel = languageCode || 'any';
+
+  const { strategies, filenameParts, metadata } = await buildSearchStrategies({
+    imdbId,
+    season,
+    episode,
+    type,
+    extra,
+    language: languageCode,
+  });
+
   const context = {
     filename: filenameParts.filename,
     showTitle: (metadata && (metadata.showTitle || metadata.originalShowTitle)) || filenameParts.showTitle,
@@ -459,17 +613,27 @@ async function findEnglishSubtitle({ imdbId, season, episode, type, extra = {} }
     filenameEpisode: filenameParts.filenameEpisode,
     season,
     episode,
+    preferredLanguage: languageCode,
   };
 
-  logger.info(`OpenSubtitles search plan: ${strategies.map((s) => s.label).join(' -> ') || 'none'}`);
+  logger.info(
+    `OpenSubtitles search plan (${languageLabel}): ${strategies.map((s) => s.label).join(' -> ') || 'none'}`
+  );
 
   for (const strategy of strategies) {
-    logger.info(`OpenSubtitles strategy: ${strategy.label}`);
-    const result = await searchOpenSubtitles(strategy.params, { ...context, strategyLabel: strategy.label });
+    logger.info(`OpenSubtitles strategy (${languageLabel}): ${strategy.label}`);
+
+    const result = await searchOpenSubtitles(strategy.params, {
+      ...context,
+      strategyLabel: strategy.label,
+    });
+
     if (result) {
       logger.info(
-        `OpenSubtitles selected subtitle via ${strategy.label}: file_id=${result.fileId} release=${result.releaseName || 'unknown'}`
+        `OpenSubtitles selected subtitle via ${strategy.label}: ` +
+        `file_id=${result.fileId} lang=${result.language || 'unknown'} release=${result.releaseName || 'unknown'}`
       );
+
       return result;
     }
   }
@@ -477,16 +641,23 @@ async function findEnglishSubtitle({ imdbId, season, episode, type, extra = {} }
   return null;
 }
 
+async function findEnglishSubtitle(args) {
+  return findSourceSubtitle({ ...args, language: 'en' });
+}
+
 async function downloadSubtitleContent(fileId) {
   assertNotInRateLimitCooldown();
+
   const headers = await authHeaders();
 
   logger.info(`Requesting OpenSubtitles download link for file_id=${fileId}`);
+
   const res = await fetch(`${BASE_URL}/download`, {
     method: 'POST',
     headers,
     body: JSON.stringify({ file_id: fileId }),
   });
+
   const json = await parseJsonResponse(res, 'OpenSubtitles download');
 
   if (!json.link) {
@@ -494,10 +665,17 @@ async function downloadSubtitleContent(fileId) {
   }
 
   const fileRes = await fetch(json.link);
+
   if (!fileRes.ok) {
     throw new Error(`Failed to fetch subtitle file content: HTTP ${fileRes.status}`);
   }
+
   return fileRes.text();
 }
 
-module.exports = { findEnglishSubtitle, downloadSubtitleContent, OpenSubtitlesRateLimitError };
+module.exports = {
+  findSourceSubtitle,
+  findEnglishSubtitle,
+  downloadSubtitleContent,
+  OpenSubtitlesRateLimitError,
+};
