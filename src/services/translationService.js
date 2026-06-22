@@ -12,23 +12,52 @@ const SYSTEM_PROMPT = [
   'You are a professional Hebrew subtitle translator.',
   'Translate subtitle text into natural, fluent, spoken Hebrew.',
   'Return valid JSON only.',
+  'Return exactly one object with one property named "items".',
+  'Each item must have exactly two fields: id and text.',
   'Preserve the id values exactly.',
   'Do not include timestamps, numbering, markdown, explanations, or extra fields.',
+  'Preserve existing simple subtitle formatting tags when they already exist, such as <i>, </i>, <b>, and </b>.',
+  'Do not invent new HTML tags.',
   'Use correct Hebrew punctuation for right-to-left reading.',
   'When a subtitle contains mixed Hebrew and English, names, acronyms, numbers, or symbols, make the final visible text read correctly in RTL.',
   'If needed, use Unicode bidirectional control characters only inside the translated text field.',
   'Use RLM (\\u200F) around Hebrew/right-to-left punctuation-sensitive text.',
   'Use LRM (\\u200E) around English words, acronyms, URLs, technical terms, or numbers that must remain left-to-right.',
   'Do not overuse direction marks.',
-  'Do not wrap every line with direction marks unless needed.',
 ].join(' ');
 
-// Chunk target sits inside the required 30-80 range. The final chunk of a
-// file may be smaller than 30 - that's just a remainder, not a violation.
-const CHUNK_SIZE = 60;
+// Smaller chunks reduce malformed JSON risk and improve retry granularity.
+const CHUNK_SIZE = 35;
 const MAX_ATTEMPTS = 3; // 1 initial attempt + 2 retries per chunk
 const RLM = '\u200F';
 const LRM = '\u200E';
+
+const TRANSLATION_RESPONSE_FORMAT = {
+  type: 'json_schema',
+  json_schema: {
+    name: 'subtitle_translation_response',
+    strict: true,
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['items'],
+      properties: {
+        items: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['id', 'text'],
+            properties: {
+              id: { type: 'number' },
+              text: { type: 'string' },
+            },
+          },
+        },
+      },
+    },
+  },
+};
 
 let client = null;
 function getClient() {
@@ -57,7 +86,13 @@ function buildUserPrompt(payload) {
     'Do not summarize. Do not censor. Do not add explanations.',
     'Preserve the "id" values exactly as given. Do not add, remove, or reorder ids.',
     'Do not return timestamps, numbering, or SRT/VTT formatting.',
-    'Return a JSON array only, with this exact shape: [{ "id": number, "text": string }].',
+    'Return a JSON object only, with this exact shape: { "items": [{ "id": number, "text": string }] }.',
+    '',
+    'Formatting rules:',
+    '- Preserve existing simple subtitle tags if they already exist: <i>, </i>, <b>, </b>.',
+    '- Do not add new HTML tags.',
+    '- If an input contains unsupported tags like <font>, translate the visible text and keep valid JSON.',
+    '- Escape any quotation marks correctly as JSON.',
     '',
     'RTL and punctuation rules:',
     '- The translated Hebrew subtitle must be visually correct for right-to-left reading.',
@@ -67,11 +102,10 @@ function buildUserPrompt(payload) {
     '- Use Unicode direction marks only when needed:',
     '  - RLM: \\u200F for Hebrew/right-to-left punctuation-sensitive text.',
     '  - LRM: \\u200E for English/left-to-right tokens, acronyms, URLs, or numbers.',
-    '- Do not add HTML tags.',
     '- Do not add VTT styling.',
     '- Do not add explanations.',
     '',
-    JSON.stringify(payload),
+    JSON.stringify({ items: payload }),
   ].join('\n');
 }
 
@@ -81,37 +115,52 @@ function stripCodeFences(text) {
   return fenced ? fenced[1].trim() : trimmed;
 }
 
-function extractJsonArraySubstring(text) {
-  const start = text.indexOf('[');
-  const end = text.lastIndexOf(']');
-  if (start === -1 || end === -1 || end < start) return null;
-  return text.slice(start, end + 1);
+function extractJsonSubstring(text) {
+  const objectStart = text.indexOf('{');
+  const objectEnd = text.lastIndexOf('}');
+  if (objectStart !== -1 && objectEnd !== -1 && objectEnd > objectStart) {
+    return text.slice(objectStart, objectEnd + 1);
+  }
+
+  const arrayStart = text.indexOf('[');
+  const arrayEnd = text.lastIndexOf(']');
+  if (arrayStart !== -1 && arrayEnd !== -1 && arrayEnd > arrayStart) {
+    return text.slice(arrayStart, arrayEnd + 1);
+  }
+
+  return null;
 }
 
-// Strips code fences if present, parses JSON, and falls back to extracting
-// the first [...] substring if the model wrapped the array in prose.
-function parseModelResponse(raw) {
+function parseJsonLeniently(raw) {
   const cleaned = stripCodeFences(raw);
 
-  let parsed;
   try {
-    parsed = JSON.parse(cleaned);
+    return JSON.parse(cleaned);
   } catch (err) {
-    const extracted = extractJsonArraySubstring(cleaned);
+    const extracted = extractJsonSubstring(cleaned);
     if (!extracted) {
       throw new Error(`Model response was not valid JSON: ${err.message}`);
     }
+
     try {
-      parsed = JSON.parse(extracted);
+      return JSON.parse(extracted);
     } catch (err2) {
       throw new Error(`Model response was not valid JSON after extraction: ${err2.message}`);
     }
   }
+}
 
-  if (!Array.isArray(parsed)) {
-    throw new Error('Model response JSON is not an array');
+// Accepts the new structured shape { items: [...] } and keeps backward
+// compatibility with the earlier array-only shape.
+function parseModelResponse(raw) {
+  const parsed = parseJsonLeniently(raw);
+  const items = Array.isArray(parsed) ? parsed : parsed && parsed.items;
+
+  if (!Array.isArray(items)) {
+    throw new Error('Model response JSON does not contain an items array');
   }
-  for (const item of parsed) {
+
+  for (const item of items) {
     if (!item || typeof item !== 'object' || Array.isArray(item)) {
       throw new Error('Model response contains a non-object item');
     }
@@ -122,7 +171,7 @@ function parseModelResponse(raw) {
       throw new Error('Model response item is missing a string text field');
     }
   }
-  return parsed;
+  return items;
 }
 
 // Validates that the model preserved the id set exactly and didn't blank
@@ -186,6 +235,7 @@ async function callModel(payload) {
   const completion = await getClient().chat.completions.create({
     model,
     temperature: 0.2,
+    response_format: TRANSLATION_RESPONSE_FORMAT,
     messages: [
       { role: 'system', content: SYSTEM_PROMPT },
       { role: 'user', content: buildUserPrompt(payload) },
