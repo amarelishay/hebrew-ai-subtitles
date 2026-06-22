@@ -11,7 +11,7 @@ const { buildSubtitleKey } = require('./utils/hash');
 
 const manifest = {
   id: 'community.hebrew-ai-subtitles',
-  version: '0.1.10',
+  version: '0.1.11',
   name: 'Hebrew AI Subtitles',
   description: 'Personal addon that translates subtitles to Hebrew on demand using OpenAI.',
   resources: ['subtitles'],
@@ -21,6 +21,7 @@ const manifest = {
 
 const builder = new addonBuilder(manifest);
 const discoveryWarmups = new Set();
+const activeResolutions = new Map();
 
 function getBaseUrl() {
   const port = process.env.PORT || 7000;
@@ -156,7 +157,7 @@ async function getGeneratedSubtitleFile({ type, id, extra = {} }, options = {}) 
     return placeholderResult('unsupported-id');
   }
 
-  return resolveGeneratedSubtitle({
+  return resolveGeneratedSubtitleWithLock({
     type,
     imdbId: parsed.imdbId,
     season: parsed.season,
@@ -298,6 +299,35 @@ async function prepareSourceSubtitle({ imdbId, season, episode, extra, sourceSub
     await cacheManager.setJobStatus(subtitleKey, 'failed', { error: err.message });
     return null;
   }
+}
+
+function resolutionKey({ type, imdbId, season, episode, extra = {} }) {
+  return JSON.stringify({
+    type,
+    imdbId,
+    season,
+    episode,
+    filename: extra.filename,
+    videoHash: extra.videoHash,
+    videoSize: extra.videoSize,
+  });
+}
+
+function resolveGeneratedSubtitleWithLock(args) {
+  const key = resolutionKey(args);
+
+  if (activeResolutions.has(key)) {
+    logger.info(`Joining active subtitle resolution: ${key}`);
+    return activeResolutions.get(key);
+  }
+
+  const promise = resolveGeneratedSubtitle(args)
+    .finally(() => {
+      activeResolutions.delete(key);
+    });
+
+  activeResolutions.set(key, promise);
+  return promise;
 }
 
 async function resolveGeneratedSubtitle({ type, imdbId, season, episode, extra = {} }) {
