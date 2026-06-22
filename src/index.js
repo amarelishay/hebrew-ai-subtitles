@@ -8,7 +8,7 @@ const { getRouter } = require('stremio-addon-sdk');
 
 const logger = require('./utils/logger');
 const cacheManager = require('./services/cacheManager');
-const { builder, manifest } = require('./addon');
+const { builder, manifest, decodeGeneratePayload, getGeneratedSubtitleFile } = require('./addon');
 
 function warnIfMissingEnv() {
   if (!process.env.OPENAI_API_KEY) {
@@ -30,6 +30,15 @@ const PUBLIC_BASE_URL = (
 
 cacheManager.ensureDirs();
 warnIfMissingEnv();
+
+function placeholderFile(kind) {
+  return path.join(__dirname, '..', 'public', 'placeholders', `${kind}.vtt`);
+}
+
+function sendVttFile(res, filePath) {
+  res.type('text/vtt');
+  return res.sendFile(filePath);
+}
 
 //
 // CORS
@@ -72,6 +81,31 @@ app.get('/', (req, res) => {
 //
 app.get('/manifest.json', (req, res) => {
   res.json(manifest);
+});
+
+//
+// The Stremio subtitles handler only advertises this URL.
+// The actual work starts here, only when the VTT URL is requested.
+//
+app.get('/generate/:payload.vtt', async (req, res) => {
+  try {
+    const requestPayload = decodeGeneratePayload(req.params.payload);
+    const result = await getGeneratedSubtitleFile(requestPayload);
+
+    if (result.kind === 'file') {
+      return sendVttFile(res, result.path);
+    }
+
+    if (result.kind === 'placeholder') {
+      return sendVttFile(res, placeholderFile(result.placeholder));
+    }
+
+    logger.error(`Unknown generated subtitle result kind: ${JSON.stringify(result)}`);
+    return sendVttFile(res, placeholderFile('failed'));
+  } catch (err) {
+    logger.error(`Failed to serve generated VTT: ${err.message}`);
+    return sendVttFile(res, placeholderFile('failed'));
+  }
 });
 
 //
