@@ -40,13 +40,39 @@ function sendVttFile(res, filePath) {
   return res.sendFile(filePath);
 }
 
+function shouldLogHttpRequest(req) {
+  const url = req.originalUrl || req.url || '';
+  return (
+    url === '/' ||
+    url === '/manifest.json' ||
+    url === '/health' ||
+    url.startsWith('/generate/') ||
+    url.includes('/subtitles/')
+  );
+}
+
 //
-// CORS
+// Request diagnostics
+//
+app.use((req, res, next) => {
+  if (shouldLogHttpRequest(req)) {
+    const ua = req.get('user-agent') || 'unknown';
+    logger.info(`HTTP ${req.method} ${req.originalUrl} ua=${ua}`);
+  }
+
+  next();
+});
+
+//
+// CORS + no-cache hints
 //
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
 
   if (req.method === 'OPTIONS') {
     return res.sendStatus(204);
@@ -141,6 +167,7 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   logger.info(`${manifest.name} v${manifest.version} listening on port ${PORT}`);
+  logger.info('HTTP request diagnostics enabled for manifest, subtitles, and generate routes.');
   logger.info(`Manifest: ${PUBLIC_BASE_URL}/manifest.json`);
   logger.info(`Health: ${PUBLIC_BASE_URL}/health`);
 });
