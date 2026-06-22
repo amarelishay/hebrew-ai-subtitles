@@ -5,6 +5,7 @@
 // available language because the downstream LLM can translate non-English text.
 // No scraping, no torrents, no video of any kind.
 
+const AdmZip = require('adm-zip');
 const logger = require('../utils/logger');
 const tmdbProvider = require('./tmdbProvider');
 
@@ -153,12 +154,13 @@ function languageCodeForOpenSubtitles(language) {
 
   if (['en', 'eng', 'english'].includes(normalized)) return 'en';
   if (['he', 'heb', 'hebrew'].includes(normalized)) return 'he';
+  if (['ar', 'ara', 'arabic'].includes(normalized)) return 'ar';
 
   return normalized;
 }
 
 function removeTrailingMediaExtension(value) {
-  return String(value || '').replace(/\.(srt|vtt|ass|ssa|sub|txt|mkv|mp4|avi|mov|webm)$/i, '');
+  return String(value || '').replace(/\.(srt|vtt|ass|ssa|sub|txt|zip|rar|mkv|mp4|avi|mov|webm)$/i, '');
 }
 
 function compact(value) {
@@ -185,7 +187,8 @@ function significantTokens(value) {
   const stopWords = new Set([
     'and', 'the', 'a', 'an', 'of', 'to', 'in', 'on', 'for', 'with', 's', 'e',
     'season', 'episode', 'web', 'dl', 'webrip', 'hdtv', 'bluray', 'aac', 'av1',
-    'x264', 'x265', 'h264', 'h265', '480p', '720p', '1080p', '2160p', 'mp4', 'mkv'
+    'x264', 'x265', 'h264', 'h265', '480p', '720p', '1080p', '2160p', 'mp4', 'mkv',
+    'subtitle', 'subtitles', 'english', 'arabic', 'hebrew', 'ara', 'eng', 'heb'
   ]);
 
   return normalizeTitleToken(value)
@@ -228,6 +231,8 @@ function seasonEpisodeCodes(season, episode) {
     `s${s2} e${e2}`,
     `${seasonNum}x${e2}`,
     `${seasonNum}x${episodeNum}`,
+    `season ${seasonNum} episode ${episodeNum}`,
+    `season ${s2} episode ${e2}`,
   ];
 }
 
@@ -292,20 +297,31 @@ function extractFilenameParts(filename) {
   return parts;
 }
 
-function searchableText(item) {
+function resultFiles(item) {
+  const attrs = item.attributes || {};
+  return Array.isArray(attrs.files) ? attrs.files.filter(Boolean) : [];
+}
+
+function resultSearchableFields(item) {
   const attrs = item.attributes || {};
   const feature = attrs.feature_details || {};
-  const file = attrs.files && attrs.files[0];
+  const files = resultFiles(item);
 
-  return normalizeTitleToken([
+  return [
     attrs.release,
-    attrs.uploader && attrs.uploader.name,
+    attrs.url,
     attrs.comments,
-    file && file.file_name,
+    attrs.language,
+    attrs.uploader && attrs.uploader.name,
     feature.title,
     feature.parent_title,
     feature.movie_name,
-  ].filter(Boolean).join(' '));
+    ...files.flatMap((file) => [file.file_name, file.filename, file.name, file.url]),
+  ].filter(Boolean);
+}
+
+function searchableText(item) {
+  return normalizeTitleToken(resultSearchableFields(item).join(' '));
 }
 
 function isExactStrategy(label) {
@@ -335,8 +351,8 @@ function isSafeFallbackCandidate(item, context = {}) {
     searchableHasSeasonEpisode(searchable, context.season, context.episode) ||
     searchableHasSeasonEpisode(searchable, context.filenameSeason, context.filenameEpisode);
 
-  if (episodeTokens.length || context.season != null || context.filenameSeason != null) {
-    return hasEpisodeTitleMatch || hasSeasonEpisodeMatch;
+  if (context.season != null || context.filenameSeason != null || episodeTokens.length) {
+    return hasSeasonEpisodeMatch || hasEpisodeTitleMatch;
   }
 
   return true;
@@ -364,7 +380,7 @@ function scoreResult(item, context = {}) {
     searchableHasSeasonEpisode(searchable, context.season, context.episode) ||
     searchableHasSeasonEpisode(searchable, context.filenameSeason, context.filenameEpisode)
   ) {
-    score += 40000;
+    score += 60000;
   }
 
   if (context.showTitle) {
@@ -378,6 +394,66 @@ function scoreResult(item, context = {}) {
   }
 
   return score;
+}
+
+function numericIdsFromText(value) {
+  const matches = String(value || '').match(/\b\d{5,}\b/g) || [];
+  return matches;
+}
+
+function unique(values) {
+  return [...new Set(values.filter((value) => value !== undefined && value !== null && String(value).trim() !== '').map(String))];
+}
+
+function candidateFileIdsForItem(item) {
+  const attrs = item.attributes || {};
+  const files = resultFiles(item);
+  const rawIds = [];
+
+  for (const file of files) {
+    rawIds.push(file.file_id, file.id, file.fileId, file.fileid);
+    rawIds.push(...numericIdsFromText(file.file_name));
+    rawIds.push(...numericIdsFromText(file.filename));
+    rawIds.push(...numericIdsFromText(file.name));
+    rawIds.push(...numericIdsFromText(file.url));
+  }
+
+  rawIds.push(attrs.file_id, attrs.fileId, attrs.subtitle_id, attrs.id, item.id);
+  rawIds.push(...numericIdsFromText(attrs.release));
+  rawIds.push(...numericIdsFromText(attrs.url));
+  rawIds.push(...numericIdsFromText(attrs.comments));
+
+  return unique(rawIds);
+}
+
+function releaseNameForItem(item) {
+  const attrs = item.attributes || {};
+  const files = resultFiles(item);
+  const firstFile = files[0] || {};
+
+  return attrs.release || firstFile.file_name || firstFile.filename || firstFile.name || attrs.url || '';
+}
+
+function sourceFromSortedResults(sorted, context = {}) {
+  const best = sorted[0];
+  const bestAttrs = best.attributes || {};
+  const candidateFileIds = [];
+
+  for (const item of sorted) {
+    candidateFileIds.push(...candidateFileIdsForItem(item));
+  }
+
+  const ids = unique(candidateFileIds);
+  if (!ids.length) return null;
+
+  return {
+    provider: 'opensubtitles',
+    fileId: ids[0],
+    candidateFileIds: ids,
+    subtitleId: best.id,
+    language: bestAttrs.language || context.preferredLanguage || 'unknown',
+    releaseName: releaseNameForItem(best),
+  };
 }
 
 function bestSubtitleFromResults(results, context = {}) {
@@ -404,18 +480,19 @@ function bestSubtitleFromResults(results, context = {}) {
     (a, b) => scoreResult(b, context) - scoreResult(a, context) || String(a.id).localeCompare(String(b.id))
   );
 
-  const best = sorted[0];
-  const file = best.attributes && best.attributes.files && best.attributes.files[0];
+  const source = sourceFromSortedResults(sorted, context);
+  if (!source) {
+    logger.warn(`OpenSubtitles ${context.strategyLabel || 'unknown'} matched result(s), but none exposed a usable file id.`);
+    return null;
+  }
 
-  if (!file) return null;
+  if (source.candidateFileIds.length > 1) {
+    logger.info(
+      `OpenSubtitles prepared ${source.candidateFileIds.length} candidate file id(s) for ${context.strategyLabel || 'unknown'}.`
+    );
+  }
 
-  return {
-    provider: 'opensubtitles',
-    fileId: file.file_id,
-    subtitleId: best.id,
-    language: (best.attributes && best.attributes.language) || 'unknown',
-    releaseName: (best.attributes && best.attributes.release) || file.file_name || '',
-  };
+  return source;
 }
 
 async function searchOpenSubtitles(params, context = {}) {
@@ -645,7 +722,32 @@ async function findEnglishSubtitle(args) {
   return findSourceSubtitle({ ...args, language: 'en' });
 }
 
-async function downloadSubtitleContent(fileId) {
+function subtitleTextFromBuffer(buffer, url = '') {
+  const looksLikeZip = /\.(zip)(\?|$)/i.test(url) || buffer.slice(0, 2).toString('utf8') === 'PK';
+
+  if (!looksLikeZip) {
+    return buffer.toString('utf8');
+  }
+
+  const zip = new AdmZip(buffer);
+  const entries = zip.getEntries()
+    .filter((entry) => !entry.isDirectory && /\.(srt|vtt)$/i.test(entry.entryName));
+
+  if (!entries.length) {
+    throw new Error('OpenSubtitles ZIP did not contain an SRT/VTT file');
+  }
+
+  entries.sort((a, b) => {
+    const aScore = /\.srt$/i.test(a.entryName) ? 0 : 1;
+    const bScore = /\.srt$/i.test(b.entryName) ? 0 : 1;
+    return aScore - bScore || a.entryName.localeCompare(b.entryName);
+  });
+
+  logger.info(`Selected subtitle file from OpenSubtitles ZIP: ${entries[0].entryName}`);
+  return entries[0].getData().toString('utf8');
+}
+
+async function downloadByFileId(fileId) {
   assertNotInRateLimitCooldown();
 
   const headers = await authHeaders();
@@ -655,7 +757,7 @@ async function downloadSubtitleContent(fileId) {
   const res = await fetch(`${BASE_URL}/download`, {
     method: 'POST',
     headers,
-    body: JSON.stringify({ file_id: fileId }),
+    body: JSON.stringify({ file_id: Number.isFinite(Number(fileId)) ? Number(fileId) : fileId }),
   });
 
   const json = await parseJsonResponse(res, 'OpenSubtitles download');
@@ -670,7 +772,28 @@ async function downloadSubtitleContent(fileId) {
     throw new Error(`Failed to fetch subtitle file content: HTTP ${fileRes.status}`);
   }
 
-  return fileRes.text();
+  const arrayBuffer = await fileRes.arrayBuffer();
+  return subtitleTextFromBuffer(Buffer.from(arrayBuffer), json.link);
+}
+
+async function downloadSubtitleContent(sourceSubtitleOrFileId) {
+  const candidates = Array.isArray(sourceSubtitleOrFileId && sourceSubtitleOrFileId.candidateFileIds)
+    ? sourceSubtitleOrFileId.candidateFileIds
+    : [sourceSubtitleOrFileId && sourceSubtitleOrFileId.fileId ? sourceSubtitleOrFileId.fileId : sourceSubtitleOrFileId];
+
+  const ids = unique(candidates);
+  let lastError = null;
+
+  for (const fileId of ids) {
+    try {
+      return await downloadByFileId(fileId);
+    } catch (err) {
+      lastError = err;
+      logger.warn(`OpenSubtitles file_id=${fileId} could not be downloaded: ${err.message}`);
+    }
+  }
+
+  throw lastError || new Error('OpenSubtitles source has no usable file_id candidates');
 }
 
 module.exports = {
