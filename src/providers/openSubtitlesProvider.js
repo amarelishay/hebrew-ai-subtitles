@@ -150,14 +150,39 @@ function normalizeTitleToken(value) {
     .replace(/&/g, ' and ')
     .replace(/[^a-z0-9]+/gi, ' ')
     .replace(/\s+/g, ' ')
-    .trim();
+    .trim()
+    .toLowerCase();
+}
+
+function significantTokens(value) {
+  const stopWords = new Set([
+    'and', 'the', 'a', 'an', 'of', 'to', 'in', 'on', 'for', 'with', 's', 'e',
+    'season', 'episode', 'web', 'dl', 'webrip', 'hdtv', 'bluray', 'aac', 'av1',
+    'x264', 'x265', 'h264', 'h265', '480p', '720p', '1080p', '2160p', 'mp4', 'mkv'
+  ]);
+
+  return normalizeTitleToken(value)
+    .split(' ')
+    .filter((token) => token.length >= 2 && !stopWords.has(token));
+}
+
+function containsAllTokens(searchable, tokens) {
+  if (!tokens.length) return true;
+  return tokens.every((token) => searchable.includes(token));
+}
+
+function seasonEpisodeCode(season, episode) {
+  if (season == null || episode == null) return null;
+  const s = String(season).padStart(2, '0');
+  const e = String(episode).padStart(2, '0');
+  return `s${s}e${e}`;
 }
 
 function extractFilenameParts(filename) {
   if (!filename) return {};
 
   const withoutExt = stripExtension(filename);
-  const seasonEpisodeMatch = withoutExt.match(/\bS(\d{1,2})E(\d{1,3})\b/i);
+  const seasonEpisodeMatch = withoutExt.match(/\bS(\d{1,2})\s*E(\d{1,3})\b/i);
 
   let showTitle = null;
   let episodeTitle = null;
@@ -175,7 +200,7 @@ function extractFilenameParts(filename) {
     if (after) {
       episodeTitle = after
         .replace(/\([^)]*\)/g, ' ')
-        .replace(/\b(\d{3,4}p|x26[45]|h\.?26[45]|web[- ]?dl|webrip|bluray|aac|av1|edge\d*)\b.*$/i, ' ')
+        .replace(/\b(\d{3,4}p|x26[45]|h\.?26[45]|web[- ]?dl|webrip|bluray|hdtv|aac|av1|edge\d*)\b.*$/i, ' ')
         .replace(/[\s\-]+$/g, '')
         .trim() || null;
     }
@@ -190,11 +215,55 @@ function extractFilenameParts(filename) {
   };
 }
 
+function searchableText(item) {
+  const attrs = item.attributes || {};
+  const feature = attrs.feature_details || {};
+  const file = attrs.files && attrs.files[0];
+  return normalizeTitleToken([
+    attrs.release,
+    attrs.uploader?.name,
+    attrs.comments,
+    file && file.file_name,
+    feature.title,
+    feature.parent_title,
+    feature.movie_name,
+  ].filter(Boolean).join(' '));
+}
+
+function isSafeFallbackCandidate(item, context = {}) {
+  const label = context.strategyLabel || '';
+
+  // Deterministic OpenSubtitles filters are already strict enough.
+  if (label === 'exact-imdb' || label === 'video-hash') return true;
+
+  const searchable = searchableText(item);
+  const showTokens = significantTokens(context.showTitle);
+  const episodeTokens = significantTokens(context.episodeTitle);
+  const seCode = seasonEpisodeCode(context.season, context.episode);
+  const filenameSeCode = seasonEpisodeCode(context.filenameSeason, context.filenameEpisode);
+
+  if (showTokens.length && !containsAllTokens(searchable, showTokens)) {
+    return false;
+  }
+
+  if (episodeTokens.length && !containsAllTokens(searchable, episodeTokens)) {
+    return false;
+  }
+
+  // If we do not have an episode title, require the season/episode code for
+  // broad filename queries. Otherwise OpenSubtitles can return a popular but
+  // totally unrelated show, as happened with Rizzoli & Isles for Drake & Josh.
+  if (!episodeTokens.length && (seCode || filenameSeCode)) {
+    const expectedCode = seCode || filenameSeCode;
+    if (!searchable.includes(expectedCode)) return false;
+  }
+
+  return true;
+}
+
 function scoreResult(item, context = {}) {
   const attrs = item.attributes || {};
-  const release = normalizeTitleToken(attrs.release || attrs.feature_details?.title || '');
-  const fileName = normalizeTitleToken((attrs.files && attrs.files[0] && attrs.files[0].file_name) || '');
-  const searchable = `${release} ${fileName}`;
+  const searchable = searchableText(item);
 
   let score = (attrs.from_trusted ? 1000000 : 0) + (attrs.download_count || 0);
 
@@ -203,9 +272,14 @@ function scoreResult(item, context = {}) {
     if (wanted && searchable.includes(wanted)) score += 50000;
   }
 
+  if (context.showTitle) {
+    const showTokens = significantTokens(context.showTitle);
+    if (containsAllTokens(searchable, showTokens)) score += 30000;
+  }
+
   if (context.episodeTitle) {
-    const wantedEpisodeTitle = normalizeTitleToken(context.episodeTitle);
-    if (wantedEpisodeTitle && searchable.includes(wantedEpisodeTitle)) score += 25000;
+    const episodeTokens = significantTokens(context.episodeTitle);
+    if (containsAllTokens(searchable, episodeTokens)) score += 25000;
   }
 
   return score;
@@ -214,9 +288,26 @@ function scoreResult(item, context = {}) {
 function bestSubtitleFromResults(results, context = {}) {
   if (!results.length) return null;
 
+  const safeResults = results.filter((item) => isSafeFallbackCandidate(item, context));
+  const rejectedCount = results.length - safeResults.length;
+
+  if (!safeResults.length) {
+    logger.warn(
+      `OpenSubtitles ${context.strategyLabel || 'unknown'} returned ${results.length} result(s), ` +
+      'but none matched the requested title safely.'
+    );
+    return null;
+  }
+
+  if (rejectedCount > 0) {
+    logger.info(
+      `OpenSubtitles rejected ${rejectedCount} unsafe candidate(s) for ${context.strategyLabel || 'unknown'}.`
+    );
+  }
+
   // Secondary sort by id keeps the pick deterministic across requests when
   // scores tie, so the resulting cache key stays stable.
-  const sorted = [...results].sort(
+  const sorted = [...safeResults].sort(
     (a, b) => scoreResult(b, context) - scoreResult(a, context) || String(a.id).localeCompare(String(b.id))
   );
   const best = sorted[0];
@@ -314,11 +405,12 @@ function buildSearchStrategies({ imdbId, season, episode, type, extra = {} }) {
     addUniqueStrategy(
       strategies,
       'show-plus-episode-title-query',
-      queryParams(`${filenameParts.showTitle} ${filenameParts.episodeTitle}`)
+      queryParams(`${filenameParts.showTitle} ${filenameParts.episodeTitle}`, { season, episode })
     );
   } else if (filenameParts.episodeTitle) {
-    addUniqueStrategy(strategies, 'episode-title-query', queryParams(filenameParts.episodeTitle));
-  } else if (filenameParts.filename) {
+    addUniqueStrategy(strategies, 'episode-title-query', queryParams(filenameParts.episodeTitle, { season, episode }));
+  } else if (filenameParts.filename && !type === 'series') {
+    // For series this is too broad and can select a completely unrelated show.
     addUniqueStrategy(strategies, 'filename-query', queryParams(filenameParts.filename));
   }
 
@@ -346,14 +438,19 @@ async function findEnglishSubtitle({ imdbId, season, episode, type, extra = {} }
   const { strategies, filenameParts } = buildSearchStrategies({ imdbId, season, episode, type, extra });
   const context = {
     filename: filenameParts.filename,
+    showTitle: filenameParts.showTitle,
     episodeTitle: filenameParts.episodeTitle,
+    filenameSeason: filenameParts.filenameSeason,
+    filenameEpisode: filenameParts.filenameEpisode,
+    season,
+    episode,
   };
 
   logger.info(`OpenSubtitles search plan: ${strategies.map((s) => s.label).join(' -> ') || 'none'}`);
 
   for (const strategy of strategies) {
     logger.info(`OpenSubtitles strategy: ${strategy.label}`);
-    const result = await searchOpenSubtitles(strategy.params, context);
+    const result = await searchOpenSubtitles(strategy.params, { ...context, strategyLabel: strategy.label });
     if (result) {
       logger.info(
         `OpenSubtitles selected subtitle via ${strategy.label}: file_id=${result.fileId} release=${result.releaseName || 'unknown'}`
