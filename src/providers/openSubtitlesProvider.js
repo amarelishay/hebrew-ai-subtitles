@@ -9,9 +9,20 @@ const logger = require('../utils/logger');
 const BASE_URL = 'https://api.opensubtitles.com/api/v1';
 const USER_AGENT = 'HebrewAISubtitles v0.1.0';
 const TOKEN_TTL_MS = 23 * 60 * 60 * 1000; // OpenSubtitles JWTs last ~24h
+const DEFAULT_MAX_SEARCH_STRATEGIES = 3;
+const RATE_LIMIT_COOLDOWN_MS = 10 * 60 * 1000;
 
 let cachedToken = null;
 let cachedTokenAt = 0;
+let rateLimitedUntil = 0;
+
+class OpenSubtitlesRateLimitError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'OpenSubtitlesRateLimitError';
+    this.code = 'OPENSUBTITLES_RATE_LIMIT';
+  }
+}
 
 function getApiKey() {
   const key = process.env.OPENSUBTITLES_API_KEY;
@@ -19,6 +30,27 @@ function getApiKey() {
     throw new Error('OPENSUBTITLES_API_KEY is not set');
   }
   return key;
+}
+
+function getMaxSearchStrategies() {
+  const configured = parseInt(process.env.OPENSUBTITLES_MAX_SEARCH_STRATEGIES || '', 10);
+  if (Number.isFinite(configured) && configured > 0) return configured;
+  return DEFAULT_MAX_SEARCH_STRATEGIES;
+}
+
+function isAggressiveFallbackEnabled() {
+  return process.env.OPENSUBTITLES_AGGRESSIVE_FALLBACK === 'true';
+}
+
+function assertNotInRateLimitCooldown() {
+  if (Date.now() < rateLimitedUntil) {
+    const waitSeconds = Math.ceil((rateLimitedUntil - Date.now()) / 1000);
+    throw new OpenSubtitlesRateLimitError(`OpenSubtitles rate limit cooldown active. Try again in ${waitSeconds}s.`);
+  }
+}
+
+function markRateLimited() {
+  rateLimitedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
 }
 
 function baseHeaders() {
@@ -37,10 +69,22 @@ async function parseJsonResponse(res, context) {
   } catch (err) {
     throw new Error(`${context}: invalid JSON response (HTTP ${res.status})`);
   }
+
+  if (res.status === 429) {
+    markRateLimited();
+    const message = (json && json.message) || 'API rate limit exceeded';
+    throw new OpenSubtitlesRateLimitError(`${context}: ${message}`);
+  }
+
   if (!res.ok) {
     const message = (json && json.message) || `HTTP ${res.status}`;
+    if (/rate\s*limit/i.test(message)) {
+      markRateLimited();
+      throw new OpenSubtitlesRateLimitError(`${context}: ${message}`);
+    }
     throw new Error(`${context}: ${message}`);
   }
+
   return json;
 }
 
@@ -58,6 +102,7 @@ async function login() {
   }
 
   try {
+    assertNotInRateLimitCooldown();
     const res = await fetch(`${BASE_URL}/login`, {
       method: 'POST',
       headers: baseHeaders(),
@@ -71,6 +116,9 @@ async function login() {
     }
     return cachedToken;
   } catch (err) {
+    if (err instanceof OpenSubtitlesRateLimitError || err.code === 'OPENSUBTITLES_RATE_LIMIT') {
+      throw err;
+    }
     logger.warn(`OpenSubtitles login failed, continuing without it: ${err.message}`);
     cachedToken = null;
     return null;
@@ -187,6 +235,7 @@ function bestSubtitleFromResults(results, context = {}) {
 }
 
 async function searchOpenSubtitles(params, context = {}) {
+  assertNotInRateLimitCooldown();
   const headers = await authHeaders();
   delete headers['Content-Type']; // GET request, no body to describe
 
@@ -256,13 +305,26 @@ function buildSearchStrategies({ imdbId, season, episode, type, extra = {} }) {
   const filenameParts = extractFilenameParts(extra.filename);
   const strategies = [];
 
-  addUniqueStrategy(strategies, 'exact-imdb', exactParams({ imdbId, season, episode, type }));
+  // Keep this conservative. OpenSubtitles search quota is easy to burn.
+  // Broad/filename searches are useful, but only after the deterministic IDs.
   addUniqueStrategy(strategies, 'video-hash', movieHashParams(extra));
+  addUniqueStrategy(strategies, 'exact-imdb', exactParams({ imdbId, season, episode, type }));
 
-  if (type === 'series' && season != null && episode != null) {
-    // Some metadata providers and OpenSubtitles disagree on TV season numbering.
-    // Try nearby seasons for the same episode as a controlled fallback.
-    for (const offset of [-1, 1, -2, 2]) {
+  if (filenameParts.showTitle && filenameParts.episodeTitle) {
+    addUniqueStrategy(
+      strategies,
+      'show-plus-episode-title-query',
+      queryParams(`${filenameParts.showTitle} ${filenameParts.episodeTitle}`)
+    );
+  } else if (filenameParts.episodeTitle) {
+    addUniqueStrategy(strategies, 'episode-title-query', queryParams(filenameParts.episodeTitle));
+  } else if (filenameParts.filename) {
+    addUniqueStrategy(strategies, 'filename-query', queryParams(filenameParts.filename));
+  }
+
+  if (isAggressiveFallbackEnabled() && type === 'series' && season != null && episode != null) {
+    // Disabled by default. This can burn several requests per selected subtitle.
+    for (const offset of [-1, 1]) {
       const altSeason = season + offset;
       if (altSeason > 0) {
         addUniqueStrategy(
@@ -274,23 +336,7 @@ function buildSearchStrategies({ imdbId, season, episode, type, extra = {} }) {
     }
   }
 
-  if (filenameParts.filename) {
-    addUniqueStrategy(strategies, 'filename-query', queryParams(filenameParts.filename, { season, episode }));
-  }
-
-  if (filenameParts.episodeTitle) {
-    addUniqueStrategy(strategies, 'episode-title-query', queryParams(filenameParts.episodeTitle, { season, episode }));
-  }
-
-  if (filenameParts.showTitle && filenameParts.episodeTitle) {
-    addUniqueStrategy(
-      strategies,
-      'show-plus-episode-title-query',
-      queryParams(`${filenameParts.showTitle} ${filenameParts.episodeTitle}`)
-    );
-  }
-
-  return { strategies, filenameParts };
+  return { strategies: strategies.slice(0, getMaxSearchStrategies()), filenameParts };
 }
 
 // Searches OpenSubtitles for an English subtitle for the given title.
@@ -302,6 +348,8 @@ async function findEnglishSubtitle({ imdbId, season, episode, type, extra = {} }
     filename: filenameParts.filename,
     episodeTitle: filenameParts.episodeTitle,
   };
+
+  logger.info(`OpenSubtitles search plan: ${strategies.map((s) => s.label).join(' -> ') || 'none'}`);
 
   for (const strategy of strategies) {
     logger.info(`OpenSubtitles strategy: ${strategy.label}`);
@@ -320,6 +368,7 @@ async function findEnglishSubtitle({ imdbId, season, episode, type, extra = {} }
 // Resolves a file_id to a temporary download link, then fetches the raw
 // subtitle text content from that link.
 async function downloadSubtitleContent(fileId) {
+  assertNotInRateLimitCooldown();
   const headers = await authHeaders();
 
   logger.info(`Requesting OpenSubtitles download link for file_id=${fileId}`);
@@ -341,4 +390,4 @@ async function downloadSubtitleContent(fileId) {
   return fileRes.text();
 }
 
-module.exports = { findEnglishSubtitle, downloadSubtitleContent };
+module.exports = { findEnglishSubtitle, downloadSubtitleContent, OpenSubtitlesRateLimitError };
