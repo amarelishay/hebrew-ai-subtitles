@@ -1,0 +1,21 @@
+{
+  "name": "hebrew-ai-subtitles",
+  "version": "0.1.0",
+  "description": "Personal Stremio addon that translates subtitles to Hebrew on demand using the OpenAI API.",
+  "main": "src/index.js",
+  "private": true,
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "express": "^4.18.2",
+    "openai": "^6.44.0",
+    "stremio-addon-sdk": "^1.6.10"
+  },
+  "license": "UNLICENSED"
+}
