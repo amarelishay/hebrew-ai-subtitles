@@ -10,7 +10,7 @@ const { buildSubtitleKey } = require('./utils/hash');
 
 const manifest = {
   id: 'community.hebrew-ai-subtitles',
-  version: '0.1.3',
+  version: '0.1.4',
   name: 'Hebrew AI Subtitles',
   description: 'Personal addon that translates subtitles to Hebrew on demand using OpenAI.',
   resources: ['subtitles'],
@@ -69,14 +69,19 @@ function parseStremioRequest({ id, extra = {} }) {
   return { rawId, imdbId, season, episode };
 }
 
+function stableOptionId({ type, id, extra = {} }) {
+  const raw = JSON.stringify({ type, id, filename: extra.filename, videoHash: extra.videoHash, videoSize: extra.videoSize });
+  const encoded = Buffer.from(raw, 'utf8').toString('base64url');
+  return `he-ai-generate-${encoded}`.slice(0, 240);
+}
+
 function generatedSubtitleOption({ type, id, extra }) {
-  const safeId = encodeURIComponent(String(id || 'unknown')).slice(0, 180);
   const url = buildGenerateUrl({ type, id, extra });
 
   logger.info(`Generated subtitle option advertised: id=${id} url=${url}`);
 
   return {
-    id: `he-ai-generate-${safeId}`,
+    id: stableOptionId({ type, id, extra }),
     name: 'Hebrew AI Subtitles - Generate Hebrew',
     url,
     // Stremio subtitle language codes are more reliable with ISO-639-2 style.
@@ -114,15 +119,16 @@ async function getGeneratedSubtitleFile({ type, id, extra = {} }) {
     imdbId: parsed.imdbId,
     season: parsed.season,
     episode: parsed.episode,
+    extra,
   });
 }
 
-async function resolveGeneratedSubtitle({ type, imdbId, season, episode }) {
+async function resolveGeneratedSubtitle({ type, imdbId, season, episode, extra = {} }) {
   const provider = 'opensubtitles';
 
   let sourceSubtitle;
   try {
-    sourceSubtitle = await openSubtitlesProvider.findEnglishSubtitle({ imdbId, season, episode, type });
+    sourceSubtitle = await openSubtitlesProvider.findEnglishSubtitle({ imdbId, season, episode, type, extra });
   } catch (err) {
     logger.error(`OpenSubtitles search failed for ${imdbId}: ${err.message}`);
     return placeholderResult('failed');
@@ -173,7 +179,7 @@ async function resolveGeneratedSubtitle({ type, imdbId, season, episode }) {
 
     await jobManager.startJob(subtitleKey, {
       blocks,
-      meta: { imdbId, season, episode, provider, sourceId: sourceSubtitle.fileId },
+      meta: { imdbId, season, episode, provider, sourceId: sourceSubtitle.fileId, extra },
     });
 
     return placeholderResult('processing');
