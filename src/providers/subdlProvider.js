@@ -130,8 +130,15 @@ function safeSourceIdFromUrl(url) {
   return `url-${shortHash(redacted)}`;
 }
 
+function firstString(...values) {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return null;
+}
+
 function getItemUrl(item) {
-  return normalizeSubtitleUrl(item.url || item.subtitle_url || item.download_url || item.file || item.path);
+  return normalizeSubtitleUrl(firstString(item.url, item.subtitle_url, item.download_url, item.file, item.path, item.link));
 }
 
 function getItemLanguage(item) {
@@ -148,8 +155,54 @@ function getItemId(item) {
   return `item-${shortHash(item)}`;
 }
 
-function searchableText(item) {
-  return normalizeTitleToken([
+function unpackFileArrays(item = {}) {
+  return [
+    item.unpack_files,
+    item.unpacked_files,
+    item.files,
+    item.file_list,
+    item.subtitles,
+  ].filter(Array.isArray);
+}
+
+function unpackFileName(file = {}) {
+  return firstString(
+    file.name,
+    file.file_name,
+    file.filename,
+    file.release_name,
+    file.subtitle_name,
+    file.path,
+    file.entry,
+    file.entry_name
+  );
+}
+
+function unpackFileUrl(file = {}) {
+  return normalizeSubtitleUrl(firstString(file.url, file.subtitle_url, file.download_url, file.file, file.path, file.link));
+}
+
+function unpackFileLanguage(file = {}) {
+  return String(file.lang || file.language || file.language_name || '').trim();
+}
+
+function unpackFiles(item = {}) {
+  return unpackFileArrays(item)
+    .flat()
+    .filter((file) => file && typeof file === 'object')
+    .map((file) => ({
+      raw: file,
+      name: unpackFileName(file),
+      url: unpackFileUrl(file),
+      language: unpackFileLanguage(file),
+    }))
+    .filter((file) => file.name || file.url);
+}
+
+function itemSearchFields(item) {
+  const unpacked = unpackFiles(item).flatMap((file) => [file.name, file.url, file.language]);
+
+  return [
     item.release_name,
     item.name,
     item.filename,
@@ -158,7 +211,13 @@ function searchableText(item) {
     item.url,
     item.subtitle_url,
     item.download_url,
-  ].filter(Boolean).join(' '));
+    item.path,
+    ...unpacked,
+  ].filter(Boolean);
+}
+
+function searchableText(item) {
+  return normalizeTitleToken(itemSearchFields(item).join(' '));
 }
 
 function hasEpisodeTitle(searchable, context = {}) {
@@ -180,6 +239,10 @@ function isExactEpisodeStrategy(label) {
   return label.startsWith('episode-imdb');
 }
 
+function isSeriesLevelStrategy(label) {
+  return label === 'imdb-tt' || label === 'imdb-numeric' || label === 'tmdb-tv';
+}
+
 function isSafeCandidate(item, context = {}) {
   const label = context.strategyLabel || '';
   const searchable = searchableText(item);
@@ -187,6 +250,10 @@ function isSafeCandidate(item, context = {}) {
   if (isExactEpisodeStrategy(label)) return true;
 
   if (!hasShowTitle(searchable, context)) return false;
+
+  if (isSeriesLevelStrategy(label) && (context.season != null || context.filenameSeason != null)) {
+    return hasEpisodeCode(searchable, context);
+  }
 
   if (context.season != null || context.filenameSeason != null || context.episodeTitle) {
     return hasEpisodeCode(searchable, context) || hasEpisodeTitle(searchable, context);
@@ -209,6 +276,34 @@ function scoreCandidate(item, context = {}) {
   return score;
 }
 
+function findBestUnpackedFile(item, context = {}) {
+  const candidates = unpackFiles(item)
+    .map((file) => {
+      const searchable = normalizeTitleToken([file.name, file.url].filter(Boolean).join(' '));
+      let score = 0;
+
+      if (/\.srt(\?|$)/i.test(file.name || file.url || '')) score += 100;
+      if (/\.vtt(\?|$)/i.test(file.name || file.url || '')) score += 75;
+      if (hasEpisodeCode(searchable, context)) score += 100000;
+      if (hasEpisodeTitle(searchable, context)) score += 25000;
+      if (context.showTitle && containsAllTokens(searchable, significantTokens(context.showTitle))) score += 10000;
+
+      return { ...file, searchable, score };
+    })
+    .filter((file) => file.score > 0 || !context.season);
+
+  if (!candidates.length) return null;
+
+  candidates.sort((a, b) => b.score - a.score || String(a.name || '').localeCompare(String(b.name || '')));
+  const best = candidates[0];
+
+  if ((context.season != null || context.filenameSeason != null) && !hasEpisodeCode(best.searchable, context)) {
+    return null;
+  }
+
+  return best;
+}
+
 function bestSubtitleFromResults(results, context = {}) {
   const safe = results.filter((item) => isSafeCandidate(item, context) && getItemUrl(item));
   if (!safe.length) {
@@ -217,16 +312,24 @@ function bestSubtitleFromResults(results, context = {}) {
   }
 
   const best = [...safe].sort((a, b) => scoreCandidate(b, context) - scoreCandidate(a, context))[0];
-  const url = getItemUrl(best);
-  const id = getItemId(best);
+  const parentUrl = getItemUrl(best);
+  const unpacked = findBestUnpackedFile(best, context);
+  const selectedUrl = unpacked && unpacked.url ? unpacked.url : parentUrl;
+  const selectedName = unpacked && unpacked.name ? unpacked.name : null;
+  const selectedLanguage = unpacked && unpacked.language ? unpacked.language : getItemLanguage(best);
+  const id = unpacked && (unpacked.name || unpacked.url)
+    ? `${getItemId(best)}:${shortHash(unpacked.name || unpacked.url)}`
+    : getItemId(best);
 
   return {
     provider: 'subdl',
     fileId: id,
     subtitleId: id,
-    language: getItemLanguage(best) || 'unknown',
-    releaseName: best.release_name || best.name || best.filename || best.file_name || redactUrl(url),
-    url,
+    language: selectedLanguage || 'unknown',
+    releaseName: selectedName || best.release_name || best.name || best.filename || best.file_name || redactUrl(parentUrl),
+    url: selectedUrl,
+    archiveUrl: parentUrl,
+    archiveEntryName: selectedName,
     season: context.season,
     episode: context.episode,
     filenameSeason: context.filenameSeason,
@@ -399,6 +502,15 @@ function chooseSubtitleEntry(entries, sourceSubtitle = {}) {
     throw new Error('SubDL ZIP did not contain an SRT/VTT file');
   }
 
+  if (sourceSubtitle.archiveEntryName) {
+    const wanted = normalizeTitleToken(sourceSubtitle.archiveEntryName);
+    const exact = subtitleEntries.find((entry) => normalizeTitleToken(entry.entryName).includes(wanted));
+    if (exact) {
+      logger.info(`Selected requested subtitle file from SubDL ZIP: ${exact.entryName}`);
+      return exact;
+    }
+  }
+
   const targetSeason = sourceSubtitle.filenameSeason || sourceSubtitle.season;
   const targetEpisode = sourceSubtitle.filenameEpisode || sourceSubtitle.episode;
 
@@ -435,7 +547,7 @@ function extractSubtitleFromZip(buffer, sourceSubtitle = {}) {
 }
 
 async function downloadSubtitleContent(sourceSubtitle) {
-  const url = sourceSubtitle && sourceSubtitle.url;
+  const url = sourceSubtitle && (sourceSubtitle.url || sourceSubtitle.archiveUrl);
   if (!url) throw new Error('SubDL source subtitle is missing url');
 
   logger.info(`Downloading SubDL subtitle: ${redactUrl(url)}`);
