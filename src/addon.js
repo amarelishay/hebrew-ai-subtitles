@@ -10,7 +10,7 @@ const { buildSubtitleKey } = require('./utils/hash');
 
 const manifest = {
   id: 'community.hebrew-ai-subtitles',
-  version: '0.1.5',
+  version: '0.1.6',
   name: 'Hebrew AI Subtitles',
   description: 'Personal addon that translates subtitles to Hebrew on demand using OpenAI.',
   resources: ['subtitles'],
@@ -92,12 +92,20 @@ function hasConcretePlaybackMetadata(extra = {}) {
   return Boolean(extra.videoHash || extra.videoSize || extra.filename);
 }
 
+function discoveryWarmupEnabled() {
+  return process.env.ENABLE_DISCOVERY_WARMUP === 'true';
+}
+
 function warmupKey({ type, id, extra = {} }) {
   return JSON.stringify({ type, id, filename: extra.filename, videoHash: extra.videoHash, videoSize: extra.videoSize });
 }
 
 function startDiscoveryWarmup({ type, id, extra = {} }) {
-  if (process.env.DISABLE_DISCOVERY_WARMUP === 'true') return;
+  if (!discoveryWarmupEnabled()) {
+    logger.info('Discovery warm-up skipped: ENABLE_DISCOVERY_WARMUP is not true.');
+    return;
+  }
+
   if (!hasConcretePlaybackMetadata(extra)) return;
 
   const key = warmupKey({ type, id, extra });
