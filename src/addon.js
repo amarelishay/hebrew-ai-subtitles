@@ -10,7 +10,7 @@ const { buildSubtitleKey } = require('./utils/hash');
 
 const manifest = {
   id: 'community.hebrew-ai-subtitles',
-  version: '0.1.4',
+  version: '0.1.5',
   name: 'Hebrew AI Subtitles',
   description: 'Personal addon that translates subtitles to Hebrew on demand using OpenAI.',
   resources: ['subtitles'],
@@ -19,6 +19,7 @@ const manifest = {
 };
 
 const builder = new addonBuilder(manifest);
+const discoveryWarmups = new Set();
 
 function getBaseUrl() {
   const port = process.env.PORT || 7000;
@@ -77,22 +78,53 @@ function stableOptionId({ type, id, extra = {} }) {
 
 function generatedSubtitleOption({ type, id, extra }) {
   const url = buildGenerateUrl({ type, id, extra });
-
   logger.info(`Generated subtitle option advertised: id=${id} url=${url}`);
 
   return {
     id: stableOptionId({ type, id, extra }),
     name: 'Hebrew AI Subtitles - Generate Hebrew',
     url,
-    // Stremio subtitle language codes are more reliable with ISO-639-2 style.
-    // Using "heb" improves compatibility versus "he" on several clients.
     lang: 'heb',
   };
+}
+
+function hasConcretePlaybackMetadata(extra = {}) {
+  return Boolean(extra.videoHash || extra.videoSize || extra.filename);
+}
+
+function warmupKey({ type, id, extra = {} }) {
+  return JSON.stringify({ type, id, filename: extra.filename, videoHash: extra.videoHash, videoSize: extra.videoSize });
+}
+
+function startDiscoveryWarmup({ type, id, extra = {} }) {
+  if (process.env.DISABLE_DISCOVERY_WARMUP === 'true') return;
+  if (!hasConcretePlaybackMetadata(extra)) return;
+
+  const key = warmupKey({ type, id, extra });
+  if (discoveryWarmups.has(key)) {
+    logger.info(`Discovery warm-up already scheduled: id=${id}`);
+    return;
+  }
+
+  discoveryWarmups.add(key);
+  logger.info(`Discovery warm-up scheduled: type=${type} id=${id} extra=${JSON.stringify(extra)}`);
+
+  setImmediate(async () => {
+    try {
+      const result = await getGeneratedSubtitleFile({ type, id, extra }, { source: 'discovery-warmup' });
+      logger.info(`Discovery warm-up completed: id=${id} result=${result.kind}${result.placeholder ? `:${result.placeholder}` : ''}`);
+    } catch (err) {
+      logger.error(`Discovery warm-up failed for id=${id}: ${err.message}`);
+    } finally {
+      discoveryWarmups.delete(key);
+    }
+  });
 }
 
 builder.defineSubtitlesHandler(async (args) => {
   const { type, id, extra = {} } = args;
   logger.info(`Subtitle discovery request received: type=${type} id=${id} extra=${JSON.stringify(extra)}`);
+  startDiscoveryWarmup({ type, id, extra });
   return { subtitles: [generatedSubtitleOption({ type, id, extra })] };
 });
 
@@ -104,8 +136,9 @@ function placeholderResult(kind) {
   return { kind: 'placeholder', placeholder: kind };
 }
 
-async function getGeneratedSubtitleFile({ type, id, extra = {} }) {
-  logger.info(`Generated VTT requested: type=${type} id=${id} extra=${JSON.stringify(extra)}`);
+async function getGeneratedSubtitleFile({ type, id, extra = {} }, options = {}) {
+  const source = options.source || 'vtt-request';
+  logger.info(`Generated subtitle requested (${source}): type=${type} id=${id} extra=${JSON.stringify(extra)}`);
 
   const parsed = parseStremioRequest({ id, extra });
 
