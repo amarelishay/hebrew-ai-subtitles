@@ -8,15 +8,27 @@
 const OpenAI = require('openai');
 const logger = require('../utils/logger');
 
-const SYSTEM_PROMPT =
-  'You are a professional subtitle translator. Translate subtitle text to ' +
-  'natural Hebrew. Return valid JSON only. Preserve the id values exactly. ' +
-  'Do not include timestamps, numbering, markdown, explanations, or extra fields.';
+const SYSTEM_PROMPT = [
+  'You are a professional Hebrew subtitle translator.',
+  'Translate subtitle text into natural, fluent, spoken Hebrew.',
+  'Return valid JSON only.',
+  'Preserve the id values exactly.',
+  'Do not include timestamps, numbering, markdown, explanations, or extra fields.',
+  'Use correct Hebrew punctuation for right-to-left reading.',
+  'When a subtitle contains mixed Hebrew and English, names, acronyms, numbers, or symbols, make the final visible text read correctly in RTL.',
+  'If needed, use Unicode bidirectional control characters only inside the translated text field.',
+  'Use RLM (\\u200F) around Hebrew/right-to-left punctuation-sensitive text.',
+  'Use LRM (\\u200E) around English words, acronyms, URLs, technical terms, or numbers that must remain left-to-right.',
+  'Do not overuse direction marks.',
+  'Do not wrap every line with direction marks unless needed.',
+].join(' ');
 
 // Chunk target sits inside the required 30-80 range. The final chunk of a
 // file may be smaller than 30 - that's just a remainder, not a violation.
 const CHUNK_SIZE = 60;
 const MAX_ATTEMPTS = 3; // 1 initial attempt + 2 retries per chunk
+const RLM = '\u200F';
+const LRM = '\u200E';
 
 let client = null;
 function getClient() {
@@ -40,12 +52,24 @@ function chunkBlocks(blocks, size = CHUNK_SIZE) {
 function buildUserPrompt(payload) {
   return [
     'Target language: Hebrew (he).',
-    'Translate the "text" field of every item below into natural, fluent Hebrew.',
+    'Translate the "text" field of every item below into natural, fluent, spoken Hebrew.',
     'Preserve names, jokes, context, and tone as much as possible.',
     'Do not summarize. Do not censor. Do not add explanations.',
     'Preserve the "id" values exactly as given. Do not add, remove, or reorder ids.',
     'Do not return timestamps, numbering, or SRT/VTT formatting.',
     'Return a JSON array only, with this exact shape: [{ "id": number, "text": string }].',
+    '',
+    'RTL and punctuation rules:',
+    '- The translated Hebrew subtitle must be visually correct for right-to-left reading.',
+    '- Put punctuation where it naturally belongs in Hebrew.',
+    '- Avoid starting a Hebrew line with punctuation that should appear at the end.',
+    '- If English words, names, acronyms, numbers, or symbols remain inside the Hebrew sentence, keep them visually stable.',
+    '- Use Unicode direction marks only when needed:',
+    '  - RLM: \\u200F for Hebrew/right-to-left punctuation-sensitive text.',
+    '  - LRM: \\u200E for English/left-to-right tokens, acronyms, URLs, or numbers.',
+    '- Do not add HTML tags.',
+    '- Do not add VTT styling.',
+    '- Do not add explanations.',
     '',
     JSON.stringify(payload),
   ].join('\n');
@@ -129,6 +153,34 @@ function validateChunkResult(inputChunk, outputItems) {
   }
 }
 
+function stripOuterDirectionMarks(text) {
+  if (!text || typeof text !== 'string') return text;
+  return text
+    .replace(/^[\u200E\u200F\u202A-\u202E\u2066-\u2069]+/, '')
+    .replace(/[\u200E\u200F\u202A-\u202E\u2066-\u2069]+$/, '');
+}
+
+function normalizeRtlSubtitleText(text) {
+  if (!text || typeof text !== 'string') return text;
+
+  return text
+    .split('\n')
+    .map((line) => {
+      const leading = line.match(/^\s*/)[0];
+      const trailing = line.match(/\s*$/)[0];
+      const core = line.slice(leading.length, line.length - trailing.length);
+
+      if (!core) return line;
+
+      const hasHebrew = /[\u0590-\u05FF]/.test(core);
+      if (!hasHebrew) return line;
+
+      const normalizedCore = stripOuterDirectionMarks(core);
+      return `${leading}${RLM}${normalizedCore}${RLM}${trailing}`;
+    })
+    .join('\n');
+}
+
 async function callModel(payload) {
   const model = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
   const completion = await getClient().chat.completions.create({
@@ -189,7 +241,7 @@ async function translateSubtitleBlocks(blocks, { subtitleKey } = {}) {
   for (let i = 0; i < chunks.length; i += 1) {
     const items = await translateChunkWithRetry(chunks[i], i + 1, chunks.length, subtitleKey);
     for (const item of items) {
-      resultMap.set(item.id, item.text);
+      resultMap.set(item.id, normalizeRtlSubtitleText(item.text));
     }
   }
 
