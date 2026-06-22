@@ -11,7 +11,7 @@ const { buildSubtitleKey } = require('./utils/hash');
 
 const manifest = {
   id: 'community.hebrew-ai-subtitles',
-  version: '0.1.8',
+  version: '0.1.9',
   name: 'Hebrew AI Subtitles',
   description: 'Personal addon that translates subtitles to Hebrew on demand using OpenAI.',
   resources: ['subtitles'],
@@ -165,7 +165,28 @@ async function getGeneratedSubtitleFile({ type, id, extra = {} }, options = {}) 
   });
 }
 
-async function trySubtitleSource({ label, providerName, finder, args }) {
+function subtitleSourceAttempts() {
+  return [
+    {
+      label: 'OpenSubtitles English',
+      finder: (args) => openSubtitlesProvider.findSourceSubtitle({ ...args, language: 'en' }),
+    },
+    {
+      label: 'SubDL English',
+      finder: (args) => subdlProvider.findSubtitle({ ...args, language: 'EN' }),
+    },
+    {
+      label: 'OpenSubtitles any language',
+      finder: (args) => openSubtitlesProvider.findSourceSubtitle({ ...args, language: null }),
+    },
+    {
+      label: 'SubDL any language',
+      finder: (args) => subdlProvider.findSubtitle({ ...args, language: null }),
+    },
+  ];
+}
+
+async function trySubtitleSource({ label, finder, args }) {
   try {
     logger.info(`Trying subtitle source: ${label}`);
     const result = await finder(args);
@@ -176,7 +197,7 @@ async function trySubtitleSource({ label, providerName, finder, args }) {
     }
 
     logger.info(
-      `Selected subtitle source: provider=${providerName} lang=${result.language || 'unknown'} ` +
+      `Selected subtitle source: provider=${result.provider || 'unknown'} lang=${result.language || 'unknown'} ` +
       `id=${result.fileId || result.subtitleId || 'unknown'} release=${result.releaseName || 'unknown'}`
     );
 
@@ -185,40 +206,6 @@ async function trySubtitleSource({ label, providerName, finder, args }) {
     logger.warn(`Subtitle source failed: ${label}: ${err.message}`);
     return null;
   }
-}
-
-async function findBestSourceSubtitle({ type, imdbId, season, episode, extra = {} }) {
-  const baseArgs = { imdbId, season, episode, type, extra };
-
-  const attempts = [
-    {
-      label: 'OpenSubtitles English',
-      providerName: 'opensubtitles',
-      finder: (args) => openSubtitlesProvider.findSourceSubtitle({ ...args, language: 'en' }),
-    },
-    {
-      label: 'SubDL English',
-      providerName: 'subdl',
-      finder: (args) => subdlProvider.findSubtitle({ ...args, language: 'EN' }),
-    },
-    {
-      label: 'OpenSubtitles any language',
-      providerName: 'opensubtitles',
-      finder: (args) => openSubtitlesProvider.findSourceSubtitle({ ...args, language: null }),
-    },
-    {
-      label: 'SubDL any language',
-      providerName: 'subdl',
-      finder: (args) => subdlProvider.findSubtitle({ ...args, language: null }),
-    },
-  ];
-
-  for (const attempt of attempts) {
-    const source = await trySubtitleSource({ ...attempt, args: baseArgs });
-    if (source) return source;
-  }
-
-  return null;
 }
 
 async function downloadSourceSubtitle(sourceSubtitle) {
@@ -237,18 +224,11 @@ async function downloadSourceSubtitle(sourceSubtitle) {
   throw new Error(`Unsupported subtitle provider: ${sourceSubtitle.provider}`);
 }
 
-async function resolveGeneratedSubtitle({ type, imdbId, season, episode, extra = {} }) {
-  const sourceSubtitle = await findBestSourceSubtitle({ type, imdbId, season, episode, extra });
-
-  if (!sourceSubtitle) {
-    logger.warn(`No subtitle source found for imdb=${imdbId} season=${season} episode=${episode}`);
-    return placeholderResult('no-source');
-  }
-
+function sourceSubtitleCacheKey({ imdbId, season, episode, sourceSubtitle }) {
   const provider = sourceSubtitle.provider || 'unknown';
   const sourceId = `${sourceSubtitle.language || 'unknown'}:${sourceSubtitle.fileId || sourceSubtitle.subtitleId || sourceSubtitle.url || ''}`;
 
-  const subtitleKey = buildSubtitleKey({
+  return buildSubtitleKey({
     imdbId,
     season,
     episode,
@@ -256,6 +236,11 @@ async function resolveGeneratedSubtitle({ type, imdbId, season, episode, extra =
     provider,
     sourceId,
   });
+}
+
+async function prepareSourceSubtitle({ imdbId, season, episode, extra, sourceSubtitle }) {
+  const provider = sourceSubtitle.provider || 'unknown';
+  const subtitleKey = sourceSubtitleCacheKey({ imdbId, season, episode, sourceSubtitle });
 
   const job = await cacheManager.getJob(subtitleKey);
   const status = job && job.status;
@@ -273,8 +258,8 @@ async function resolveGeneratedSubtitle({ type, imdbId, season, episode, extra =
   if (status === 'processing') {
     logger.warn(`Found stale processing status for ${subtitleKey}, restarting job.`);
   } else if (status === 'failed') {
-    logger.info(`Previous translation failed for ${subtitleKey}, serving failure placeholder`);
-    return placeholderResult('failed');
+    logger.warn(`Skipping previously failed source ${subtitleKey} and trying next source if available.`);
+    return null;
   }
 
   logger.info(
@@ -306,10 +291,40 @@ async function resolveGeneratedSubtitle({ type, imdbId, season, episode, extra =
 
     return placeholderResult('processing');
   } catch (err) {
-    logger.error(`Failed to prepare source subtitle for ${subtitleKey}: ${err.message}`);
+    logger.warn(
+      `Source preparation failed for provider=${provider} lang=${sourceSubtitle.language || 'unknown'} ` +
+      `id=${sourceSubtitle.fileId || sourceSubtitle.subtitleId || 'unknown'}: ${err.message}`
+    );
     await cacheManager.setJobStatus(subtitleKey, 'failed', { error: err.message });
+    return null;
+  }
+}
+
+async function resolveGeneratedSubtitle({ type, imdbId, season, episode, extra = {} }) {
+  const args = { imdbId, season, episode, type, extra };
+  let sawSource = false;
+
+  for (const attempt of subtitleSourceAttempts()) {
+    const sourceSubtitle = await trySubtitleSource({ ...attempt, args });
+    if (!sourceSubtitle) continue;
+
+    sawSource = true;
+    const prepared = await prepareSourceSubtitle({ imdbId, season, episode, extra, sourceSubtitle });
+
+    if (prepared) {
+      return prepared;
+    }
+
+    logger.warn('Trying next subtitle source after preparation failure.');
+  }
+
+  if (sawSource) {
+    logger.error(`Subtitle sources were found but none could be prepared for imdb=${imdbId} season=${season} episode=${episode}`);
     return placeholderResult('failed');
   }
+
+  logger.warn(`No subtitle source found for imdb=${imdbId} season=${season} episode=${episode}`);
+  return placeholderResult('no-source');
 }
 
 module.exports = {
