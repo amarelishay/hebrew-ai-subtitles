@@ -11,7 +11,7 @@ const { buildSubtitleKey } = require('./utils/hash');
 
 const manifest = {
   id: 'community.hebrew-ai-subtitles',
-  version: '0.1.15',
+  version: '0.1.16',
   name: 'Hebrew AI Subtitles',
   description: 'Personal addon that translates subtitles to Hebrew on demand using OpenAI.',
   resources: ['subtitles'],
@@ -43,9 +43,11 @@ function makeSelectionNonce() {
 }
 
 function buildGenerateUrl({ type, id, extra = {}, nonce }) {
-  const payload = encodeGeneratePayload({ type, id, extra });
-  const url = `${getBaseUrl()}/generate/${payload}.vtt`;
-  return nonce ? `${url}?selection=${encodeURIComponent(nonce)}` : url;
+  // Put the selection nonce inside the encoded path, not as a query string.
+  // Some Stremio clients/cache layers are less reliable with subtitle URL query
+  // params, while a different .vtt path is treated as a genuinely new file.
+  const payload = encodeGeneratePayload({ type, id, extra, selection: nonce || null });
+  return `${getBaseUrl()}/generate/${payload}.vtt`;
 }
 
 function parseNumber(value) {
@@ -78,23 +80,23 @@ function parseStremioRequest({ id, extra = {} }) {
 }
 
 function stableOptionId({ type, id, extra = {}, nonce }) {
-  const raw = JSON.stringify({ type, id, filename: extra.filename, videoHash: extra.videoHash, videoSize: extra.videoSize });
+  const raw = JSON.stringify({ type, id, filename: extra.filename, videoHash: extra.videoHash, videoSize: extra.videoSize, nonce });
   const encoded = Buffer.from(raw, 'utf8').toString('base64url');
 
   // Stremio can cache subtitle options aggressively. Keep a per-discovery nonce
   // in the option id so an explicit user selection is more likely to fetch the
   // generated VTT URL, without enabling discovery warm-up.
-  const prefix = nonce ? `he-ai-generate-${nonce}-` : 'he-ai-generate-';
-  return `${prefix}${encoded}`.slice(0, 240);
+  return `he-ai-generate-${encoded}`.slice(0, 240);
 }
 
 function generatedSubtitleOption({ type, id, extra }) {
   const nonce = makeSelectionNonce();
   const url = buildGenerateUrl({ type, id, extra, nonce });
-  logger.info(`Generated subtitle option advertised: id=${id} selection=${nonce} url=${url}`);
+  const optionId = stableOptionId({ type, id, extra, nonce });
+  logger.info(`Generated subtitle option advertised: id=${id} optionId=${optionId} selection=${nonce} url=${url}`);
 
   return {
-    id: stableOptionId({ type, id, extra, nonce }),
+    id: optionId,
     name: 'Hebrew AI Subtitles - Generate Hebrew',
     url,
     lang: 'heb',
