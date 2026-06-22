@@ -11,7 +11,7 @@ const { buildSubtitleKey } = require('./utils/hash');
 
 const manifest = {
   id: 'community.hebrew-ai-subtitles',
-  version: '0.1.11',
+  version: '0.1.12',
   name: 'Hebrew AI Subtitles',
   description: 'Personal addon that translates subtitles to Hebrew on demand using OpenAI.',
   resources: ['subtitles'],
@@ -173,12 +173,12 @@ function subtitleSourceAttempts() {
       finder: (args) => openSubtitlesProvider.findSourceSubtitle({ ...args, language: 'en' }),
     },
     {
-      label: 'SubDL English',
-      finder: (args) => subdlProvider.findSubtitle({ ...args, language: 'EN' }),
-    },
-    {
       label: 'OpenSubtitles any language',
       finder: (args) => openSubtitlesProvider.findSourceSubtitle({ ...args, language: null }),
+    },
+    {
+      label: 'SubDL English',
+      finder: (args) => subdlProvider.findSubtitle({ ...args, language: 'EN' }),
     },
     {
       label: 'SubDL any language',
@@ -259,8 +259,7 @@ async function prepareSourceSubtitle({ imdbId, season, episode, extra, sourceSub
   if (status === 'processing') {
     logger.warn(`Found stale processing status for ${subtitleKey}, restarting job.`);
   } else if (status === 'failed') {
-    logger.warn(`Skipping previously failed source ${subtitleKey} and trying next source if available.`);
-    return null;
+    logger.info(`Retrying previously failed source ${subtitleKey}.`);
   }
 
   logger.info(
