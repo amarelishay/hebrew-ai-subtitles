@@ -221,7 +221,7 @@ function searchableText(item) {
   const file = attrs.files && attrs.files[0];
   return normalizeTitleToken([
     attrs.release,
-    attrs.uploader?.name,
+    attrs.uploader && attrs.uploader.name,
     attrs.comments,
     file && file.file_name,
     feature.title,
@@ -409,7 +409,7 @@ function buildSearchStrategies({ imdbId, season, episode, type, extra = {} }) {
     );
   } else if (filenameParts.episodeTitle) {
     addUniqueStrategy(strategies, 'episode-title-query', queryParams(filenameParts.episodeTitle, { season, episode }));
-  } else if (filenameParts.filename && !type === 'series') {
+  } else if (filenameParts.filename && type !== 'series') {
     // For series this is too broad and can select a completely unrelated show.
     addUniqueStrategy(strategies, 'filename-query', queryParams(filenameParts.filename));
   }
