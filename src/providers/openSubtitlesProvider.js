@@ -14,6 +14,7 @@ const USER_AGENT = 'HebrewAISubtitles v0.1.0';
 const TOKEN_TTL_MS = 23 * 60 * 60 * 1000;
 const DEFAULT_MAX_SEARCH_STRATEGIES = 4;
 const RATE_LIMIT_COOLDOWN_MS = 10 * 60 * 1000;
+const MAX_DOWNLOAD_CANDIDATES = 6;
 
 let cachedToken = null;
 let cachedTokenAt = 0;
@@ -43,6 +44,10 @@ function getMaxSearchStrategies() {
 
 function isAggressiveFallbackEnabled() {
   return process.env.OPENSUBTITLES_AGGRESSIVE_FALLBACK === 'true';
+}
+
+function isRateLimitError(err) {
+  return err instanceof OpenSubtitlesRateLimitError || err.code === 'OPENSUBTITLES_RATE_LIMIT';
 }
 
 function assertNotInRateLimitCooldown() {
@@ -126,9 +131,7 @@ async function login() {
 
     return cachedToken;
   } catch (err) {
-    if (err instanceof OpenSubtitlesRateLimitError || err.code === 'OPENSUBTITLES_RATE_LIMIT') {
-      throw err;
-    }
+    if (isRateLimitError(err)) throw err;
 
     logger.warn(`OpenSubtitles login failed, continuing without it: ${err.message}`);
     cachedToken = null;
@@ -207,14 +210,9 @@ function seasonEpisodeCode(season, episode) {
   const seasonNum = parseInt(season, 10);
   const episodeNum = parseInt(episode, 10);
 
-  if (!Number.isFinite(seasonNum) || !Number.isFinite(episodeNum)) {
-    return null;
-  }
+  if (!Number.isFinite(seasonNum) || !Number.isFinite(episodeNum)) return null;
 
-  const s = String(seasonNum).padStart(2, '0');
-  const e = String(episodeNum).padStart(2, '0');
-
-  return `s${s}e${e}`;
+  return `s${String(seasonNum).padStart(2, '0')}e${String(episodeNum).padStart(2, '0')}`;
 }
 
 function seasonEpisodeCodes(season, episode) {
@@ -246,10 +244,7 @@ function cleanEpisodeTitle(value) {
   const cleaned = removeTrailingMediaExtension(value)
     .replace(/\([^)]*\)/g, ' ')
     .replace(/\[[^\]]*\]/g, ' ')
-    .replace(
-      /\b(\d{3,4}p|x26[45]|h\.?26[45]|web[- ]?dl|web[- ]?rip|bluray|brrip|hdtv|aac|av1|edge\d*|proper|repack)\b.*$/i,
-      ' '
-    )
+    .replace(/\b(\d{3,4}p|x26[45]|h\.?26[45]|web[- ]?dl|web[- ]?rip|bluray|brrip|hdtv|aac|av1|edge\d*|proper|repack)\b.*$/i, ' ')
     .replace(/[\s\-_.]+$/g, '')
     .replace(/^[\s\-_.]+/g, '')
     .replace(/\s+/g, ' ')
@@ -262,27 +257,19 @@ function extractFilenameParts(filename) {
   if (!filename) return {};
 
   const withoutExt = stripExtension(filename);
-
-  const seasonEpisodeMatch =
-    withoutExt.match(/\bS\s*(\d{1,2})\s*E\s*(\d{1,3})\b/i) ||
-    withoutExt.match(/\b(\d{1,2})x(\d{1,3})\b/i);
+  const seasonEpisodeMatch = withoutExt.match(/\bS\s*(\d{1,2})\s*E\s*(\d{1,3})\b/i)
+    || withoutExt.match(/\b(\d{1,2})x(\d{1,3})\b/i);
 
   let showTitle = null;
   let episodeTitle = null;
 
   if (seasonEpisodeMatch) {
-    const before = withoutExt
-      .slice(0, seasonEpisodeMatch.index)
-      .replace(/[\s\-]+$/g, '')
-      .trim();
-
-    const after = withoutExt
-      .slice(seasonEpisodeMatch.index + seasonEpisodeMatch[0].length)
-      .replace(/^[\s\-]+/g, '')
-      .trim();
-
-    showTitle = before || null;
-    episodeTitle = cleanEpisodeTitle(after);
+    showTitle = withoutExt.slice(0, seasonEpisodeMatch.index).replace(/[\s\-]+$/g, '').trim() || null;
+    episodeTitle = cleanEpisodeTitle(
+      withoutExt.slice(seasonEpisodeMatch.index + seasonEpisodeMatch[0].length)
+        .replace(/^[\s\-]+/g, '')
+        .trim()
+    );
   }
 
   const parts = {
@@ -330,18 +317,13 @@ function isExactStrategy(label) {
 
 function isSafeFallbackCandidate(item, context = {}) {
   const label = context.strategyLabel || '';
-
-  if (isExactStrategy(label)) {
-    return true;
-  }
+  if (isExactStrategy(label)) return true;
 
   const searchable = searchableText(item);
   const showTokens = significantTokens(context.showTitle);
   const episodeTokens = significantTokens(context.episodeTitle);
 
-  if (showTokens.length && !containsAllTokens(searchable, showTokens)) {
-    return false;
-  }
+  if (showTokens.length && !containsAllTokens(searchable, showTokens)) return false;
 
   const hasEpisodeTitleMatch = episodeTokens.length
     ? containsAllTokens(searchable, episodeTokens)
@@ -361,14 +343,11 @@ function isSafeFallbackCandidate(item, context = {}) {
 function scoreResult(item, context = {}) {
   const attrs = item.attributes || {};
   const searchable = searchableText(item);
-
   let score = (attrs.from_trusted ? 1000000 : 0) + (attrs.download_count || 0);
 
   if (context.preferredLanguage) {
     const lang = String(attrs.language || '').toLowerCase();
-    if (lang === context.preferredLanguage || lang.startsWith(context.preferredLanguage)) {
-      score += 500000;
-    }
+    if (lang === context.preferredLanguage || lang.startsWith(context.preferredLanguage)) score += 500000;
   }
 
   if (context.filename) {
@@ -383,26 +362,24 @@ function scoreResult(item, context = {}) {
     score += 60000;
   }
 
-  if (context.showTitle) {
-    const showTokens = significantTokens(context.showTitle);
-    if (containsAllTokens(searchable, showTokens)) score += 30000;
-  }
-
-  if (context.episodeTitle) {
-    const episodeTokens = significantTokens(context.episodeTitle);
-    if (containsAllTokens(searchable, episodeTokens)) score += 25000;
-  }
+  if (context.showTitle && containsAllTokens(searchable, significantTokens(context.showTitle))) score += 30000;
+  if (context.episodeTitle && containsAllTokens(searchable, significantTokens(context.episodeTitle))) score += 25000;
 
   return score;
 }
 
-function numericIdsFromText(value) {
-  const matches = String(value || '').match(/\b\d{5,}\b/g) || [];
-  return matches;
-}
-
 function unique(values) {
   return [...new Set(values.filter((value) => value !== undefined && value !== null && String(value).trim() !== '').map(String))];
+}
+
+function strictIdsFromFileText(value) {
+  const text = String(value || '');
+  const ids = [];
+
+  for (const match of text.matchAll(/\((\d{5,})\)/g)) ids.push(match[1]);
+  for (const match of text.matchAll(/(?:file_id=|subtitle\/|download\/)(\d{5,})/gi)) ids.push(match[1]);
+
+  return ids;
 }
 
 function candidateFileIdsForItem(item) {
@@ -411,17 +388,15 @@ function candidateFileIdsForItem(item) {
   const rawIds = [];
 
   for (const file of files) {
-    rawIds.push(file.file_id, file.id, file.fileId, file.fileid);
-    rawIds.push(...numericIdsFromText(file.file_name));
-    rawIds.push(...numericIdsFromText(file.filename));
-    rawIds.push(...numericIdsFromText(file.name));
-    rawIds.push(...numericIdsFromText(file.url));
+    rawIds.push(file.file_id, file.fileId, file.fileid);
+    rawIds.push(...strictIdsFromFileText(file.file_name));
+    rawIds.push(...strictIdsFromFileText(file.filename));
+    rawIds.push(...strictIdsFromFileText(file.name));
+    rawIds.push(...strictIdsFromFileText(file.url));
   }
 
-  rawIds.push(attrs.file_id, attrs.fileId, attrs.subtitle_id, attrs.id, item.id);
-  rawIds.push(...numericIdsFromText(attrs.release));
-  rawIds.push(...numericIdsFromText(attrs.url));
-  rawIds.push(...numericIdsFromText(attrs.comments));
+  rawIds.push(attrs.file_id, attrs.fileId);
+  rawIds.push(...strictIdsFromFileText(attrs.url));
 
   return unique(rawIds);
 }
@@ -430,7 +405,6 @@ function releaseNameForItem(item) {
   const attrs = item.attributes || {};
   const files = resultFiles(item);
   const firstFile = files[0] || {};
-
   return attrs.release || firstFile.file_name || firstFile.filename || firstFile.name || attrs.url || '';
 }
 
@@ -439,11 +413,12 @@ function sourceFromSortedResults(sorted, context = {}) {
   const bestAttrs = best.attributes || {};
   const candidateFileIds = [];
 
-  for (const item of sorted) {
+  for (const item of sorted.slice(0, 4)) {
     candidateFileIds.push(...candidateFileIdsForItem(item));
+    if (unique(candidateFileIds).length >= MAX_DOWNLOAD_CANDIDATES) break;
   }
 
-  const ids = unique(candidateFileIds);
+  const ids = unique(candidateFileIds).slice(0, MAX_DOWNLOAD_CANDIDATES);
   if (!ids.length) return null;
 
   return {
@@ -471,9 +446,7 @@ function bestSubtitleFromResults(results, context = {}) {
   }
 
   if (rejectedCount > 0) {
-    logger.info(
-      `OpenSubtitles rejected ${rejectedCount} unsafe candidate(s) for ${context.strategyLabel || 'unknown'}.`
-    );
+    logger.info(`OpenSubtitles rejected ${rejectedCount} unsafe candidate(s) for ${context.strategyLabel || 'unknown'}.`);
   }
 
   const sorted = [...safeResults].sort(
@@ -497,26 +470,20 @@ function bestSubtitleFromResults(results, context = {}) {
 
 async function searchOpenSubtitles(params, context = {}) {
   assertNotInRateLimitCooldown();
-
   const headers = await authHeaders();
 
   logger.info(`Searching OpenSubtitles: ${params.toString()}`);
-
   const res = await fetch(`${BASE_URL}/subtitles?${params.toString()}`, { headers });
   const json = await parseJsonResponse(res, 'OpenSubtitles search');
 
   const results = Array.isArray(json.data) ? json.data : [];
-
   logger.info(`OpenSubtitles returned ${results.length} result(s).`);
-
   return bestSubtitleFromResults(results, context);
 }
 
 function setLanguageParam(params, language) {
   const code = languageCodeForOpenSubtitles(language);
-  if (code) {
-    params.set('languages', code);
-  }
+  if (code) params.set('languages', code);
   return params;
 }
 
@@ -545,79 +512,45 @@ function imdbIdParams(imdbId, language) {
 
 function movieHashParams(extra = {}, language) {
   if (!extra.videoHash) return null;
-
   const params = new URLSearchParams({ moviehash: String(extra.videoHash) });
   setLanguageParam(params, language);
-
-  if (extra.videoSize) {
-    params.set('moviebytesize', String(extra.videoSize));
-  }
-
+  if (extra.videoSize) params.set('moviebytesize', String(extra.videoSize));
   return params;
 }
 
 function queryParams(query, { language, season, episode } = {}) {
   if (!query || !query.trim()) return null;
-
   const params = new URLSearchParams({ query: query.trim() });
   setLanguageParam(params, language);
-
   if (season != null) params.set('season_number', String(season));
   if (episode != null) params.set('episode_number', String(episode));
-
   return params;
 }
 
 function addUniqueStrategy(strategies, label, params) {
   if (!params) return;
-
   const key = params.toString();
-
   if (!key || strategies.some((s) => s.key === key)) return;
-
   strategies.push({ label, params, key });
 }
 
 function addTitleFallbacks(strategies, filenameParts, metadata, season, episode, language) {
-  const showTitle =
-    (metadata && (metadata.showTitle || metadata.originalShowTitle)) ||
-    filenameParts.showTitle;
-
-  const episodeTitle =
-    (metadata && metadata.episodeTitle) ||
-    filenameParts.episodeTitle;
-
+  const showTitle = (metadata && (metadata.showTitle || metadata.originalShowTitle)) || filenameParts.showTitle;
+  const episodeTitle = (metadata && metadata.episodeTitle) || filenameParts.episodeTitle;
   const effectiveSeason = filenameParts.filenameSeason || season;
   const effectiveEpisode = filenameParts.filenameEpisode || episode;
   const seCompact = seasonEpisodeCode(effectiveSeason, effectiveEpisode);
 
   if (showTitle && seCompact) {
-    addUniqueStrategy(
-      strategies,
-      'show-plus-season-episode-query',
-      queryParams(`${showTitle} ${seCompact.toUpperCase()}`, { language })
-    );
+    addUniqueStrategy(strategies, 'show-plus-season-episode-query', queryParams(`${showTitle} ${seCompact.toUpperCase()}`, { language }));
   }
 
   if (showTitle && episodeTitle) {
-    addUniqueStrategy(
-      strategies,
-      'show-plus-episode-title-query',
-      queryParams(`${showTitle} ${episodeTitle}`, { language })
-    );
+    addUniqueStrategy(strategies, 'show-plus-episode-title-query', queryParams(`${showTitle} ${episodeTitle}`, { language }));
   }
 
-  if (
-    metadata &&
-    metadata.originalShowTitle &&
-    metadata.episodeTitle &&
-    metadata.originalShowTitle !== metadata.showTitle
-  ) {
-    addUniqueStrategy(
-      strategies,
-      'original-show-plus-episode-title-query',
-      queryParams(`${metadata.originalShowTitle} ${metadata.episodeTitle}`, { language })
-    );
+  if (metadata && metadata.originalShowTitle && metadata.episodeTitle && metadata.originalShowTitle !== metadata.showTitle) {
+    addUniqueStrategy(strategies, 'original-show-plus-episode-title-query', queryParams(`${metadata.originalShowTitle} ${metadata.episodeTitle}`, { language }));
   }
 
   if (episodeTitle) {
@@ -627,13 +560,11 @@ function addTitleFallbacks(strategies, filenameParts, metadata, season, episode,
 
 async function buildSearchStrategies({ imdbId, season, episode, type, extra = {}, language = 'en' }) {
   const filenameParts = extractFilenameParts(extra.filename);
-
   const metadata = type === 'series'
     ? await tmdbProvider.getEpisodeMetadata({ imdbId, season, episode })
     : null;
 
   const strategies = [];
-
   addUniqueStrategy(strategies, 'video-hash', movieHashParams(extra, language));
 
   if (metadata && metadata.episodeImdbId) {
@@ -641,7 +572,6 @@ async function buildSearchStrategies({ imdbId, season, episode, type, extra = {}
   }
 
   addUniqueStrategy(strategies, 'exact-imdb', exactParams({ imdbId, season, episode, type, language }));
-
   addTitleFallbacks(strategies, filenameParts, metadata, season, episode, language);
 
   if (!metadata && filenameParts.filename && type !== 'series') {
@@ -651,36 +581,19 @@ async function buildSearchStrategies({ imdbId, season, episode, type, extra = {}
   if (isAggressiveFallbackEnabled() && type === 'series' && season != null && episode != null) {
     for (const offset of [-1, 1]) {
       const altSeason = season + offset;
-
       if (altSeason > 0) {
-        addUniqueStrategy(
-          strategies,
-          `nearby-season-${altSeason}`,
-          exactParams({ imdbId, season: altSeason, episode, type, language })
-        );
+        addUniqueStrategy(strategies, `nearby-season-${altSeason}`, exactParams({ imdbId, season: altSeason, episode, type, language }));
       }
     }
   }
 
-  return {
-    strategies: strategies.slice(0, getMaxSearchStrategies()),
-    filenameParts,
-    metadata,
-  };
+  return { strategies: strategies.slice(0, getMaxSearchStrategies()), filenameParts, metadata };
 }
 
 async function findSourceSubtitle({ imdbId, season, episode, type, extra = {}, language = 'en' }) {
   const languageCode = languageCodeForOpenSubtitles(language);
   const languageLabel = languageCode || 'any';
-
-  const { strategies, filenameParts, metadata } = await buildSearchStrategies({
-    imdbId,
-    season,
-    episode,
-    type,
-    extra,
-    language: languageCode,
-  });
+  const { strategies, filenameParts, metadata } = await buildSearchStrategies({ imdbId, season, episode, type, extra, language: languageCode });
 
   const context = {
     filename: filenameParts.filename,
@@ -693,24 +606,16 @@ async function findSourceSubtitle({ imdbId, season, episode, type, extra = {}, l
     preferredLanguage: languageCode,
   };
 
-  logger.info(
-    `OpenSubtitles search plan (${languageLabel}): ${strategies.map((s) => s.label).join(' -> ') || 'none'}`
-  );
+  logger.info(`OpenSubtitles search plan (${languageLabel}): ${strategies.map((s) => s.label).join(' -> ') || 'none'}`);
 
   for (const strategy of strategies) {
     logger.info(`OpenSubtitles strategy (${languageLabel}): ${strategy.label}`);
-
-    const result = await searchOpenSubtitles(strategy.params, {
-      ...context,
-      strategyLabel: strategy.label,
-    });
-
+    const result = await searchOpenSubtitles(strategy.params, { ...context, strategyLabel: strategy.label });
     if (result) {
       logger.info(
         `OpenSubtitles selected subtitle via ${strategy.label}: ` +
         `file_id=${result.fileId} lang=${result.language || 'unknown'} release=${result.releaseName || 'unknown'}`
       );
-
       return result;
     }
   }
@@ -725,17 +630,13 @@ async function findEnglishSubtitle(args) {
 function subtitleTextFromBuffer(buffer, url = '') {
   const looksLikeZip = /\.(zip)(\?|$)/i.test(url) || buffer.slice(0, 2).toString('utf8') === 'PK';
 
-  if (!looksLikeZip) {
-    return buffer.toString('utf8');
-  }
+  if (!looksLikeZip) return buffer.toString('utf8');
 
   const zip = new AdmZip(buffer);
   const entries = zip.getEntries()
     .filter((entry) => !entry.isDirectory && /\.(srt|vtt)$/i.test(entry.entryName));
 
-  if (!entries.length) {
-    throw new Error('OpenSubtitles ZIP did not contain an SRT/VTT file');
-  }
+  if (!entries.length) throw new Error('OpenSubtitles ZIP did not contain an SRT/VTT file');
 
   entries.sort((a, b) => {
     const aScore = /\.srt$/i.test(a.entryName) ? 0 : 1;
@@ -749,11 +650,9 @@ function subtitleTextFromBuffer(buffer, url = '') {
 
 async function downloadByFileId(fileId) {
   assertNotInRateLimitCooldown();
-
   const headers = await authHeaders();
 
   logger.info(`Requesting OpenSubtitles download link for file_id=${fileId}`);
-
   const res = await fetch(`${BASE_URL}/download`, {
     method: 'POST',
     headers,
@@ -761,16 +660,10 @@ async function downloadByFileId(fileId) {
   });
 
   const json = await parseJsonResponse(res, 'OpenSubtitles download');
-
-  if (!json.link) {
-    throw new Error('OpenSubtitles download response is missing a link');
-  }
+  if (!json.link) throw new Error('OpenSubtitles download response is missing a link');
 
   const fileRes = await fetch(json.link);
-
-  if (!fileRes.ok) {
-    throw new Error(`Failed to fetch subtitle file content: HTTP ${fileRes.status}`);
-  }
+  if (!fileRes.ok) throw new Error(`Failed to fetch subtitle file content: HTTP ${fileRes.status}`);
 
   const arrayBuffer = await fileRes.arrayBuffer();
   return subtitleTextFromBuffer(Buffer.from(arrayBuffer), json.link);
@@ -781,8 +674,10 @@ async function downloadSubtitleContent(sourceSubtitleOrFileId) {
     ? sourceSubtitleOrFileId.candidateFileIds
     : [sourceSubtitleOrFileId && sourceSubtitleOrFileId.fileId ? sourceSubtitleOrFileId.fileId : sourceSubtitleOrFileId];
 
-  const ids = unique(rawCandidates.flatMap((value) => String(value).split('|')));
+  const ids = unique(rawCandidates.flatMap((value) => String(value).split('|'))).slice(0, MAX_DOWNLOAD_CANDIDATES);
   let lastError = null;
+
+  logger.info(`OpenSubtitles will try ${ids.length} download candidate(s).`);
 
   for (const fileId of ids) {
     try {
@@ -790,6 +685,10 @@ async function downloadSubtitleContent(sourceSubtitleOrFileId) {
     } catch (err) {
       lastError = err;
       logger.warn(`OpenSubtitles file_id=${fileId} could not be downloaded: ${err.message}`);
+
+      if (isRateLimitError(err)) {
+        throw err;
+      }
     }
   }
 
