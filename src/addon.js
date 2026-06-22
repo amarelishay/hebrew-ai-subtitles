@@ -11,7 +11,7 @@ const { buildSubtitleKey } = require('./utils/hash');
 
 const manifest = {
   id: 'community.hebrew-ai-subtitles',
-  version: '0.1.12',
+  version: '0.1.13',
   name: 'Hebrew AI Subtitles',
   description: 'Personal addon that translates subtitles to Hebrew on demand using OpenAI.',
   resources: ['subtitles'],
@@ -171,6 +171,10 @@ function subtitleSourceAttempts() {
     {
       label: 'OpenSubtitles English',
       finder: (args) => openSubtitlesProvider.findSourceSubtitle({ ...args, language: 'en' }),
+    },
+    {
+      label: 'OpenSubtitles Arabic',
+      finder: (args) => openSubtitlesProvider.findSourceSubtitle({ ...args, language: 'ar' }),
     },
     {
       label: 'OpenSubtitles any language',
