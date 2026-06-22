@@ -5,12 +5,13 @@ const logger = require('./utils/logger');
 const cacheManager = require('./services/cacheManager');
 const jobManager = require('./services/jobManager');
 const openSubtitlesProvider = require('./providers/openSubtitlesProvider');
+const subdlProvider = require('./providers/subdlProvider');
 const { parseSrt } = require('./utils/srtParser');
 const { buildSubtitleKey } = require('./utils/hash');
 
 const manifest = {
   id: 'community.hebrew-ai-subtitles',
-  version: '0.1.7',
+  version: '0.1.8',
   name: 'Hebrew AI Subtitles',
   description: 'Personal addon that translates subtitles to Hebrew on demand using OpenAI.',
   resources: ['subtitles'],
@@ -164,21 +165,88 @@ async function getGeneratedSubtitleFile({ type, id, extra = {} }, options = {}) 
   });
 }
 
-async function resolveGeneratedSubtitle({ type, imdbId, season, episode, extra = {} }) {
-  const provider = 'opensubtitles';
-
-  let sourceSubtitle;
+async function trySubtitleSource({ label, providerName, finder, args }) {
   try {
-    sourceSubtitle = await openSubtitlesProvider.findEnglishSubtitle({ imdbId, season, episode, type, extra });
+    logger.info(`Trying subtitle source: ${label}`);
+    const result = await finder(args);
+
+    if (!result) {
+      logger.info(`Subtitle source returned no safe result: ${label}`);
+      return null;
+    }
+
+    logger.info(
+      `Selected subtitle source: provider=${providerName} lang=${result.language || 'unknown'} ` +
+      `id=${result.fileId || result.subtitleId || 'unknown'} release=${result.releaseName || 'unknown'}`
+    );
+
+    return result;
   } catch (err) {
-    logger.error(`OpenSubtitles search failed for ${imdbId}: ${err.message}`);
-    return placeholderResult('failed');
+    logger.warn(`Subtitle source failed: ${label}: ${err.message}`);
+    return null;
   }
+}
+
+async function findBestSourceSubtitle({ type, imdbId, season, episode, extra = {} }) {
+  const baseArgs = { imdbId, season, episode, type, extra };
+
+  const attempts = [
+    {
+      label: 'OpenSubtitles English',
+      providerName: 'opensubtitles',
+      finder: (args) => openSubtitlesProvider.findSourceSubtitle({ ...args, language: 'en' }),
+    },
+    {
+      label: 'SubDL English',
+      providerName: 'subdl',
+      finder: (args) => subdlProvider.findSubtitle({ ...args, language: 'EN' }),
+    },
+    {
+      label: 'OpenSubtitles any language',
+      providerName: 'opensubtitles',
+      finder: (args) => openSubtitlesProvider.findSourceSubtitle({ ...args, language: null }),
+    },
+    {
+      label: 'SubDL any language',
+      providerName: 'subdl',
+      finder: (args) => subdlProvider.findSubtitle({ ...args, language: null }),
+    },
+  ];
+
+  for (const attempt of attempts) {
+    const source = await trySubtitleSource({ ...attempt, args: baseArgs });
+    if (source) return source;
+  }
+
+  return null;
+}
+
+async function downloadSourceSubtitle(sourceSubtitle) {
+  if (!sourceSubtitle || !sourceSubtitle.provider) {
+    throw new Error('Missing source subtitle provider');
+  }
+
+  if (sourceSubtitle.provider === 'opensubtitles') {
+    return openSubtitlesProvider.downloadSubtitleContent(sourceSubtitle.fileId);
+  }
+
+  if (sourceSubtitle.provider === 'subdl') {
+    return subdlProvider.downloadSubtitleContent(sourceSubtitle);
+  }
+
+  throw new Error(`Unsupported subtitle provider: ${sourceSubtitle.provider}`);
+}
+
+async function resolveGeneratedSubtitle({ type, imdbId, season, episode, extra = {} }) {
+  const sourceSubtitle = await findBestSourceSubtitle({ type, imdbId, season, episode, extra });
 
   if (!sourceSubtitle) {
-    logger.warn(`No English subtitle source found for imdb=${imdbId} season=${season} episode=${episode}`);
+    logger.warn(`No subtitle source found for imdb=${imdbId} season=${season} episode=${episode}`);
     return placeholderResult('no-source');
   }
+
+  const provider = sourceSubtitle.provider || 'unknown';
+  const sourceId = `${sourceSubtitle.language || 'unknown'}:${sourceSubtitle.fileId || sourceSubtitle.subtitleId || sourceSubtitle.url || ''}`;
 
   const subtitleKey = buildSubtitleKey({
     imdbId,
@@ -186,7 +254,7 @@ async function resolveGeneratedSubtitle({ type, imdbId, season, episode, extra =
     episode,
     lang: 'he',
     provider,
-    sourceId: sourceSubtitle.fileId,
+    sourceId,
   });
 
   const job = await cacheManager.getJob(subtitleKey);
@@ -209,9 +277,13 @@ async function resolveGeneratedSubtitle({ type, imdbId, season, episode, extra =
     return placeholderResult('failed');
   }
 
-  logger.info(`Cache miss for ${subtitleKey}, preparing source subtitle from OpenSubtitles`);
+  logger.info(
+    `Cache miss for ${subtitleKey}, preparing source subtitle from ${provider} ` +
+    `(sourceLanguage=${sourceSubtitle.language || 'unknown'})`
+  );
+
   try {
-    const rawSubtitle = await openSubtitlesProvider.downloadSubtitleContent(sourceSubtitle.fileId);
+    const rawSubtitle = await downloadSourceSubtitle(sourceSubtitle);
     const blocks = parseSrt(rawSubtitle);
 
     if (blocks.length === 0) {
@@ -220,7 +292,16 @@ async function resolveGeneratedSubtitle({ type, imdbId, season, episode, extra =
 
     await jobManager.startJob(subtitleKey, {
       blocks,
-      meta: { imdbId, season, episode, provider, sourceId: sourceSubtitle.fileId, extra },
+      meta: {
+        imdbId,
+        season,
+        episode,
+        provider,
+        sourceLanguage: sourceSubtitle.language || 'unknown',
+        sourceId: sourceSubtitle.fileId || sourceSubtitle.subtitleId || sourceSubtitle.url,
+        releaseName: sourceSubtitle.releaseName,
+        extra,
+      },
     });
 
     return placeholderResult('processing');
