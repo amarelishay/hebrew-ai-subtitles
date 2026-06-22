@@ -12,20 +12,15 @@ const { builder, manifest } = require('./addon');
 
 function warnIfMissingEnv() {
   if (!process.env.OPENAI_API_KEY) {
-    logger.warn('OPENAI_API_KEY is not set - translation jobs will fail until it is configured.');
+    logger.warn('OPENAI_API_KEY is not set.');
   }
 
   if (!process.env.OPENSUBTITLES_API_KEY) {
-    logger.warn('OPENSUBTITLES_API_KEY is not set - subtitle search will fail until it is configured.');
-  }
-
-  if (!process.env.PUBLIC_BASE_URL) {
-    logger.warn('PUBLIC_BASE_URL is not set - generated subtitle URLs may be wrong in production.');
+    logger.warn('OPENSUBTITLES_API_KEY is not set.');
   }
 }
 
 const app = express();
-
 const PORT = process.env.PORT || 7000;
 
 const PUBLIC_BASE_URL = (
@@ -36,61 +31,75 @@ const PUBLIC_BASE_URL = (
 cacheManager.ensureDirs();
 warnIfMissingEnv();
 
-const addonInterface = builder.getInterface();
+//
+// CORS
+//
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
 
-app.disable('x-powered-by');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
 
-app.get('/', (req, res) => {
-  res
-    .type('text/plain')
-    .send(`${manifest.name} v${manifest.version} is running. Use /manifest.json to install in Stremio.`);
+  next();
 });
 
+//
+// Health Check
+//
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     service: manifest.name,
     version: manifest.version,
-    uptime: process.uptime(),
-    publicBaseUrl: PUBLIC_BASE_URL
+    uptime: process.uptime()
   });
 });
 
-/**
- * Explicit Stremio manifest route.
- * Do not rely only on getRouter for this, because if SDK routing changes
- * or is mounted incorrectly, Stremio will fail with "Not Found".
- */
+//
+// Root
+//
+app.get('/', (req, res) => {
+  res.send(
+    `${manifest.name} v${manifest.version} is running. Use /manifest.json to install in Stremio.`
+  );
+});
+
+//
+// Explicit manifest route
+//
 app.get('/manifest.json', (req, res) => {
   res.json(manifest);
 });
 
-/**
- * Serve generated subtitle files:
- * /subtitles/xxx.vtt
- * /placeholders/processing.vtt
- */
+//
+// Static files
+//
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
-/**
- * Mount Stremio SDK routes.
- * This should expose:
- * /manifest.json
- * /subtitles/:type/:id/:extra?.json
- */
-app.use(getRouter(addonInterface));
+//
+// Stremio routes
+//
+app.use(getRouter(builder.getInterface()));
 
+//
+// 404
+//
 app.use((req, res) => {
-  logger.warn(`404 Not Found: ${req.method} ${req.originalUrl}`);
   res.status(404).json({
     error: 'Not Found',
-    path: req.originalUrl,
-    hint: 'Try /health or /manifest.json'
+    path: req.originalUrl
   });
 });
 
+//
+// Error handler
+//
 app.use((err, req, res, next) => {
-  logger.error(`Unhandled server error: ${err.stack || err.message}`);
+  logger.error(err.stack || err.message);
+
   res.status(500).json({
     error: 'Internal Server Error'
   });
@@ -98,6 +107,6 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   logger.info(`${manifest.name} v${manifest.version} listening on port ${PORT}`);
-  logger.info(`Health: ${PUBLIC_BASE_URL}/health`);
   logger.info(`Manifest: ${PUBLIC_BASE_URL}/manifest.json`);
+  logger.info(`Health: ${PUBLIC_BASE_URL}/health`);
 });
