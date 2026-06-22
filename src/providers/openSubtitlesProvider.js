@@ -5,11 +5,12 @@
 // serves - no scraping, no torrents, no video of any kind.
 
 const logger = require('../utils/logger');
+const tmdbProvider = require('./tmdbProvider');
 
 const BASE_URL = 'https://api.opensubtitles.com/api/v1';
 const USER_AGENT = 'HebrewAISubtitles v0.1.0';
 const TOKEN_TTL_MS = 23 * 60 * 60 * 1000; // OpenSubtitles JWTs last ~24h
-const DEFAULT_MAX_SEARCH_STRATEGIES = 3;
+const DEFAULT_MAX_SEARCH_STRATEGIES = 4;
 const RATE_LIMIT_COOLDOWN_MS = 10 * 60 * 1000;
 
 let cachedToken = null;
@@ -88,9 +89,6 @@ async function parseJsonResponse(res, context) {
   return json;
 }
 
-// Logs in only if credentials are configured, caching the JWT for
-// TOKEN_TTL_MS. OpenSubtitles rate-limits /login, so on failure we fall
-// back to anonymous Api-Key-only access instead of retrying aggressively.
 async function login() {
   const username = process.env.OPENSUBTITLES_USERNAME;
   const password = process.env.OPENSUBTITLES_PASSWORD;
@@ -146,8 +144,6 @@ function compact(value) {
 }
 
 function stripExtension(filename) {
-  // Remove the extension before compact() turns dots into spaces. The previous
-  // order turned "file.mp4" into "file mp4", which polluted title queries.
   return compact(removeTrailingMediaExtension(filename));
 }
 
@@ -249,8 +245,7 @@ function searchableText(item) {
 function isSafeFallbackCandidate(item, context = {}) {
   const label = context.strategyLabel || '';
 
-  // Deterministic OpenSubtitles filters are already strict enough.
-  if (label === 'exact-imdb' || label === 'video-hash') return true;
+  if (label === 'exact-imdb' || label === 'episode-imdb' || label === 'video-hash') return true;
 
   const searchable = searchableText(item);
   const showTokens = significantTokens(context.showTitle);
@@ -266,9 +261,6 @@ function isSafeFallbackCandidate(item, context = {}) {
     return false;
   }
 
-  // If we do not have an episode title, require the season/episode code for
-  // broad filename queries. Otherwise OpenSubtitles can return a popular but
-  // totally unrelated show, as happened with Rizzoli & Isles for Drake & Josh.
   if (!episodeTokens.length && (seCode || filenameSeCode)) {
     const expectedCode = seCode || filenameSeCode;
     if (!searchable.includes(expectedCode)) return false;
@@ -321,16 +313,12 @@ function bestSubtitleFromResults(results, context = {}) {
     );
   }
 
-  // Secondary sort by id keeps the pick deterministic across requests when
-  // scores tie, so the resulting cache key stays stable.
   const sorted = [...safeResults].sort(
     (a, b) => scoreResult(b, context) - scoreResult(a, context) || String(a.id).localeCompare(String(b.id))
   );
   const best = sorted[0];
   const file = best.attributes && best.attributes.files && best.attributes.files[0];
-  if (!file) {
-    return null;
-  }
+  if (!file) return null;
 
   return {
     provider: 'opensubtitles',
@@ -344,7 +332,7 @@ function bestSubtitleFromResults(results, context = {}) {
 async function searchOpenSubtitles(params, context = {}) {
   assertNotInRateLimitCooldown();
   const headers = await authHeaders();
-  delete headers['Content-Type']; // GET request, no body to describe
+  delete headers['Content-Type'];
 
   logger.info(`Searching OpenSubtitles: ${params.toString()}`);
   const res = await fetch(`${BASE_URL}/subtitles?${params.toString()}`, { headers });
@@ -360,7 +348,6 @@ function exactParams({ imdbId, season, episode, type }) {
   const params = new URLSearchParams({ languages: 'en' });
 
   if (type === 'series' && season != null && episode != null) {
-    // Stremio passes the show's imdb id for episodes, not a per-episode id.
     params.set('parent_imdb_id', numericImdbId);
     params.set('season_number', String(season));
     params.set('episode_number', String(episode));
@@ -371,6 +358,12 @@ function exactParams({ imdbId, season, episode, type }) {
   return params;
 }
 
+function imdbIdParams(imdbId) {
+  if (!imdbId) return null;
+  const numericImdbId = String(imdbId).replace(/^tt/i, '');
+  return new URLSearchParams({ languages: 'en', imdb_id: numericImdbId });
+}
+
 function movieHashParams(extra = {}) {
   if (!extra.videoHash) return null;
 
@@ -379,7 +372,6 @@ function movieHashParams(extra = {}) {
     moviehash: String(extra.videoHash),
   });
 
-  // OpenSubtitles may use this together with moviehash when available.
   if (extra.videoSize) {
     params.set('moviebytesize', String(extra.videoSize));
   }
@@ -390,14 +382,9 @@ function movieHashParams(extra = {}) {
 function queryParams(query, { season, episode } = {}) {
   if (!query || !query.trim()) return null;
 
-  const params = new URLSearchParams({
-    languages: 'en',
-    query: query.trim(),
-  });
-
+  const params = new URLSearchParams({ languages: 'en', query: query.trim() });
   if (season != null) params.set('season_number', String(season));
   if (episode != null) params.set('episode_number', String(episode));
-
   return params;
 }
 
@@ -408,57 +395,66 @@ function addUniqueStrategy(strategies, label, params) {
   strategies.push({ label, params, key });
 }
 
-function buildSearchStrategies({ imdbId, season, episode, type, extra = {} }) {
-  const filenameParts = extractFilenameParts(extra.filename);
-  const strategies = [];
+function addTitleFallbacks(strategies, filenameParts, metadata) {
+  const showTitle = (metadata && (metadata.showTitle || metadata.originalShowTitle)) || filenameParts.showTitle;
+  const episodeTitle = (metadata && metadata.episodeTitle) || filenameParts.episodeTitle;
 
-  // Keep this conservative. OpenSubtitles search quota is easy to burn.
-  // Broad/title searches are useful, but only after deterministic IDs.
-  addUniqueStrategy(strategies, 'video-hash', movieHashParams(extra));
-  addUniqueStrategy(strategies, 'exact-imdb', exactParams({ imdbId, season, episode, type }));
+  if (showTitle && episodeTitle) {
+    addUniqueStrategy(strategies, 'show-plus-episode-title-query', queryParams(`${showTitle} ${episodeTitle}`));
+  }
 
-  if (filenameParts.showTitle && filenameParts.episodeTitle) {
-    // Do not add season_number/episode_number to the title fallback. The exact
-    // strategy already covered that. OpenSubtitles often has title matches that
-    // are not indexed under the same season mapping used by Stremio.
+  if (metadata && metadata.originalShowTitle && metadata.episodeTitle && metadata.originalShowTitle !== metadata.showTitle) {
     addUniqueStrategy(
       strategies,
-      'show-plus-episode-title-query',
-      queryParams(`${filenameParts.showTitle} ${filenameParts.episodeTitle}`)
+      'original-show-plus-episode-title-query',
+      queryParams(`${metadata.originalShowTitle} ${metadata.episodeTitle}`)
     );
-  } else if (filenameParts.episodeTitle) {
-    addUniqueStrategy(strategies, 'episode-title-query', queryParams(filenameParts.episodeTitle));
-  } else if (filenameParts.filename && type !== 'series') {
-    // For series this is too broad and can select a completely unrelated show.
+  }
+
+  if (episodeTitle) {
+    addUniqueStrategy(strategies, 'episode-title-query', queryParams(episodeTitle));
+  }
+}
+
+async function buildSearchStrategies({ imdbId, season, episode, type, extra = {} }) {
+  const filenameParts = extractFilenameParts(extra.filename);
+  const metadata = type === 'series'
+    ? await tmdbProvider.getEpisodeMetadata({ imdbId, season, episode })
+    : null;
+
+  const strategies = [];
+
+  addUniqueStrategy(strategies, 'video-hash', movieHashParams(extra));
+
+  if (metadata && metadata.episodeImdbId) {
+    addUniqueStrategy(strategies, 'episode-imdb', imdbIdParams(metadata.episodeImdbId));
+  }
+
+  addUniqueStrategy(strategies, 'exact-imdb', exactParams({ imdbId, season, episode, type }));
+  addTitleFallbacks(strategies, filenameParts, metadata);
+
+  if (!metadata && filenameParts.filename && type !== 'series') {
     addUniqueStrategy(strategies, 'filename-query', queryParams(filenameParts.filename));
   }
 
   if (isAggressiveFallbackEnabled() && type === 'series' && season != null && episode != null) {
-    // Disabled by default. This can burn several requests per selected subtitle.
     for (const offset of [-1, 1]) {
       const altSeason = season + offset;
       if (altSeason > 0) {
-        addUniqueStrategy(
-          strategies,
-          `nearby-season-${altSeason}`,
-          exactParams({ imdbId, season: altSeason, episode, type })
-        );
+        addUniqueStrategy(strategies, `nearby-season-${altSeason}`, exactParams({ imdbId, season: altSeason, episode, type }));
       }
     }
   }
 
-  return { strategies: strategies.slice(0, getMaxSearchStrategies()), filenameParts };
+  return { strategies: strategies.slice(0, getMaxSearchStrategies()), filenameParts, metadata };
 }
 
-// Searches OpenSubtitles for an English subtitle for the given title.
-// Returns { provider, fileId, subtitleId, language, releaseName } or null
-// if nothing is found.
 async function findEnglishSubtitle({ imdbId, season, episode, type, extra = {} }) {
-  const { strategies, filenameParts } = buildSearchStrategies({ imdbId, season, episode, type, extra });
+  const { strategies, filenameParts, metadata } = await buildSearchStrategies({ imdbId, season, episode, type, extra });
   const context = {
     filename: filenameParts.filename,
-    showTitle: filenameParts.showTitle,
-    episodeTitle: filenameParts.episodeTitle,
+    showTitle: (metadata && (metadata.showTitle || metadata.originalShowTitle)) || filenameParts.showTitle,
+    episodeTitle: (metadata && metadata.episodeTitle) || filenameParts.episodeTitle,
     filenameSeason: filenameParts.filenameSeason,
     filenameEpisode: filenameParts.filenameEpisode,
     season,
@@ -481,8 +477,6 @@ async function findEnglishSubtitle({ imdbId, season, episode, type, extra = {} }
   return null;
 }
 
-// Resolves a file_id to a temporary download link, then fetches the raw
-// subtitle text content from that link.
 async function downloadSubtitleContent(fileId) {
   assertNotInRateLimitCooldown();
   const headers = await authHeaders();
