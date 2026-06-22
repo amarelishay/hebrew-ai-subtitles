@@ -1,5 +1,6 @@
 'use strict';
 
+const AdmZip = require('adm-zip');
 const logger = require('../utils/logger');
 const tmdbProvider = require('./tmdbProvider');
 const { shortHash } = require('../utils/hash');
@@ -23,7 +24,7 @@ function compact(value) {
 }
 
 function stripExtension(value) {
-  return compact(String(value || '').replace(/\.(srt|vtt|ass|ssa|sub|txt|mkv|mp4|avi|mov|webm)$/i, ''));
+  return compact(String(value || '').replace(/\.(srt|vtt|ass|ssa|sub|txt|zip|rar|mkv|mp4|avi|mov|webm)$/i, ''));
 }
 
 function normalizeTitleToken(value) {
@@ -39,7 +40,8 @@ function significantTokens(value) {
   const stopWords = new Set([
     'and', 'the', 'a', 'an', 'of', 'to', 'in', 'on', 'for', 'with', 's', 'e',
     'season', 'episode', 'web', 'dl', 'webrip', 'hdtv', 'bluray', 'aac', 'av1',
-    'x264', 'x265', 'h264', 'h265', '480p', '720p', '1080p', '2160p', 'mp4', 'mkv'
+    'x264', 'x265', 'h264', 'h265', '480p', '720p', '1080p', '2160p', 'mp4', 'mkv',
+    'subtitle', 'subtitles', 'english', 'arabic', 'hebrew'
   ]);
 
   return normalizeTitleToken(value).split(' ').filter((token) => token.length >= 2 && !stopWords.has(token));
@@ -60,9 +62,20 @@ function seasonEpisodeCode(season, episode) {
 function seasonEpisodeCodes(season, episode) {
   const compactCode = seasonEpisodeCode(season, episode);
   if (!compactCode) return [];
+
   const s = parseInt(season, 10);
   const e = parseInt(episode, 10);
-  return [compactCode, `${s}x${String(e).padStart(2, '0')}`, `${s}x${e}`];
+  const s2 = String(s).padStart(2, '0');
+  const e2 = String(e).padStart(2, '0');
+
+  return [
+    compactCode,
+    `s${s2} e${e2}`,
+    `${s}x${e2}`,
+    `${s}x${e}`,
+    `season ${s} episode ${e}`,
+    `season ${s2} episode ${e2}`,
+  ];
 }
 
 function hasSeasonEpisode(searchable, season, episode) {
@@ -108,6 +121,15 @@ function normalizeSubtitleUrl(url) {
   return `${FILE_BASE_URL}/${url}`;
 }
 
+function redactUrl(url) {
+  return String(url || '').replace(/([?&]api_key=)[^&]+/i, '$1***');
+}
+
+function safeSourceIdFromUrl(url) {
+  const redacted = redactUrl(url);
+  return `url-${shortHash(redacted)}`;
+}
+
 function getItemUrl(item) {
   return normalizeSubtitleUrl(item.url || item.subtitle_url || item.download_url || item.file || item.path);
 }
@@ -117,7 +139,13 @@ function getItemLanguage(item) {
 }
 
 function getItemId(item) {
-  return String(item.file_id || item.file_n_id || item.n_id || item.sd_id || item.id || item.md5 || getItemUrl(item) || shortHash(item));
+  const explicitId = item.file_id || item.file_n_id || item.n_id || item.sd_id || item.id || item.md5;
+  if (explicitId) return String(explicitId);
+
+  const url = getItemUrl(item);
+  if (url) return safeSourceIdFromUrl(url);
+
+  return `item-${shortHash(item)}`;
 }
 
 function searchableText(item) {
@@ -133,21 +161,35 @@ function searchableText(item) {
   ].filter(Boolean).join(' '));
 }
 
+function hasEpisodeTitle(searchable, context = {}) {
+  const episodeTokens = significantTokens(context.episodeTitle);
+  return episodeTokens.length ? containsAllTokens(searchable, episodeTokens) : false;
+}
+
+function hasEpisodeCode(searchable, context = {}) {
+  return hasSeasonEpisode(searchable, context.season, context.episode) ||
+    hasSeasonEpisode(searchable, context.filenameSeason, context.filenameEpisode);
+}
+
+function hasShowTitle(searchable, context = {}) {
+  const showTokens = significantTokens(context.showTitle);
+  return showTokens.length ? containsAllTokens(searchable, showTokens) : true;
+}
+
+function isExactEpisodeStrategy(label) {
+  return label.startsWith('episode-imdb');
+}
+
 function isSafeCandidate(item, context = {}) {
   const label = context.strategyLabel || '';
-  if (label.includes('imdb') || label.includes('tmdb')) return true;
-
   const searchable = searchableText(item);
-  const showTokens = significantTokens(context.showTitle);
-  const episodeTokens = significantTokens(context.episodeTitle);
 
-  if (showTokens.length && !containsAllTokens(searchable, showTokens)) return false;
+  if (isExactEpisodeStrategy(label)) return true;
 
-  const hasEpisodeTitle = episodeTokens.length ? containsAllTokens(searchable, episodeTokens) : false;
-  const hasEpisodeCode = hasSeasonEpisode(searchable, context.season, context.episode) || hasSeasonEpisode(searchable, context.filenameSeason, context.filenameEpisode);
+  if (!hasShowTitle(searchable, context)) return false;
 
-  if (episodeTokens.length || context.season != null || context.filenameSeason != null) {
-    return hasEpisodeTitle || hasEpisodeCode;
+  if (context.season != null || context.filenameSeason != null || context.episodeTitle) {
+    return hasEpisodeCode(searchable, context) || hasEpisodeTitle(searchable, context);
   }
 
   return true;
@@ -159,10 +201,10 @@ function scoreCandidate(item, context = {}) {
 
   const lang = getItemLanguage(item).toLowerCase();
   if (context.preferredLanguage && lang.includes(String(context.preferredLanguage).toLowerCase())) score += 100000;
-  if (hasSeasonEpisode(searchable, context.season, context.episode)) score += 40000;
-  if (hasSeasonEpisode(searchable, context.filenameSeason, context.filenameEpisode)) score += 40000;
+  if (hasEpisodeCode(searchable, context)) score += 60000;
   if (context.showTitle && containsAllTokens(searchable, significantTokens(context.showTitle))) score += 30000;
-  if (context.episodeTitle && containsAllTokens(searchable, significantTokens(context.episodeTitle))) score += 25000;
+  if (hasEpisodeTitle(searchable, context)) score += 25000;
+  if (getItemUrl(item) && !/\.(zip|rar)(\?|$)/i.test(getItemUrl(item))) score += 5000;
 
   return score;
 }
@@ -183,8 +225,12 @@ function bestSubtitleFromResults(results, context = {}) {
     fileId: id,
     subtitleId: id,
     language: getItemLanguage(best) || 'unknown',
-    releaseName: best.release_name || best.name || best.filename || best.file_name || url,
+    releaseName: best.release_name || best.name || best.filename || best.file_name || redactUrl(url),
     url,
+    season: context.season,
+    episode: context.episode,
+    filenameSeason: context.filenameSeason,
+    filenameEpisode: context.filenameEpisode,
   };
 }
 
@@ -324,7 +370,10 @@ async function findSubtitle({ imdbId, season, episode, type, extra = {}, languag
       logger.info(`SubDL strategy: ${strategy.label}`);
       const result = await searchSubDL(strategy.params, { ...context, strategyLabel: strategy.label });
       if (result) {
-        logger.info(`SubDL selected subtitle via ${strategy.label}: id=${result.fileId} release=${result.releaseName || 'unknown'} language=${result.language}`);
+        logger.info(
+          `SubDL selected subtitle via ${strategy.label}: id=${result.fileId} ` +
+          `release=${result.releaseName || 'unknown'} language=${result.language}`
+        );
         return result;
       }
     } catch (err) {
@@ -339,18 +388,68 @@ async function findEnglishSubtitle(args) {
   return findSubtitle({ ...args, language: 'EN' });
 }
 
+function bufferToUtf8(buffer) {
+  return Buffer.from(buffer).toString('utf8');
+}
+
+function chooseSubtitleEntry(entries, sourceSubtitle = {}) {
+  const subtitleEntries = entries.filter((entry) => !entry.isDirectory && /\.(srt|vtt)$/i.test(entry.entryName));
+
+  if (!subtitleEntries.length) {
+    throw new Error('SubDL ZIP did not contain an SRT/VTT file');
+  }
+
+  const targetSeason = sourceSubtitle.filenameSeason || sourceSubtitle.season;
+  const targetEpisode = sourceSubtitle.filenameEpisode || sourceSubtitle.episode;
+
+  const scored = subtitleEntries.map((entry) => {
+    const searchable = normalizeTitleToken(entry.entryName);
+    let score = /\.srt$/i.test(entry.entryName) ? 100 : 50;
+
+    if (hasSeasonEpisode(searchable, targetSeason, targetEpisode)) score += 10000;
+    if (sourceSubtitle.releaseName && normalizeTitleToken(sourceSubtitle.releaseName) && searchable.includes(normalizeTitleToken(stripExtension(sourceSubtitle.releaseName)))) {
+      score += 500;
+    }
+
+    return { entry, score };
+  });
+
+  scored.sort((a, b) => b.score - a.score || a.entry.entryName.localeCompare(b.entry.entryName));
+
+  const best = scored[0];
+  const bestSearchable = normalizeTitleToken(best.entry.entryName);
+  const hasTargetEpisode = hasSeasonEpisode(bestSearchable, targetSeason, targetEpisode);
+
+  if (targetSeason != null && targetEpisode != null && subtitleEntries.length > 1 && !hasTargetEpisode) {
+    throw new Error(`SubDL ZIP contained ${subtitleEntries.length} subtitle files but none matched requested episode ${seasonEpisodeCode(targetSeason, targetEpisode)}`);
+  }
+
+  logger.info(`Selected subtitle file from SubDL ZIP: ${best.entry.entryName}`);
+  return best.entry;
+}
+
+function extractSubtitleFromZip(buffer, sourceSubtitle = {}) {
+  const zip = new AdmZip(buffer);
+  const entry = chooseSubtitleEntry(zip.getEntries(), sourceSubtitle);
+  return bufferToUtf8(entry.getData());
+}
+
 async function downloadSubtitleContent(sourceSubtitle) {
   const url = sourceSubtitle && sourceSubtitle.url;
   if (!url) throw new Error('SubDL source subtitle is missing url');
 
-  if (/\.(zip)(\?|$)/i.test(url)) {
-    throw new Error('SubDL archive subtitle source is not supported yet');
-  }
-
-  logger.info(`Downloading SubDL subtitle: ${url}`);
+  logger.info(`Downloading SubDL subtitle: ${redactUrl(url)}`);
   const res = await fetch(url);
   if (!res.ok) throw new Error(`SubDL subtitle download failed: HTTP ${res.status}`);
-  return res.text();
+
+  const arrayBuffer = await res.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+
+  if (/\.(zip)(\?|$)/i.test(url)) {
+    return extractSubtitleFromZip(buffer, sourceSubtitle);
+  }
+
+  return bufferToUtf8(buffer);
 }
 
 module.exports = {
