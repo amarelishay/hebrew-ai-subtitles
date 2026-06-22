@@ -134,6 +134,10 @@ async function authHeaders() {
   return headers;
 }
 
+function removeTrailingMediaExtension(value) {
+  return String(value || '').replace(/\.(srt|vtt|ass|ssa|sub|txt|mkv|mp4|avi|mov|webm)$/i, '');
+}
+
 function compact(value) {
   return String(value || '')
     .replace(/[_\.]+/g, ' ')
@@ -142,7 +146,9 @@ function compact(value) {
 }
 
 function stripExtension(filename) {
-  return compact(filename).replace(/\.[a-z0-9]{2,5}$/i, '').trim();
+  // Remove the extension before compact() turns dots into spaces. The previous
+  // order turned "file.mp4" into "file mp4", which polluted title queries.
+  return compact(removeTrailingMediaExtension(filename));
 }
 
 function normalizeTitleToken(value) {
@@ -178,11 +184,27 @@ function seasonEpisodeCode(season, episode) {
   return `s${s}e${e}`;
 }
 
+function cleanEpisodeTitle(value) {
+  if (!value) return null;
+
+  const cleaned = removeTrailingMediaExtension(value)
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/\[[^\]]*\]/g, ' ')
+    .replace(/\b(\d{3,4}p|x26[45]|h\.?26[45]|web[- ]?dl|web[- ]?rip|bluray|brrip|hdtv|aac|av1|edge\d*|proper|repack)\b.*$/i, ' ')
+    .replace(/[\s\-_.]+$/g, '')
+    .replace(/^[\s\-_.]+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return cleaned || null;
+}
+
 function extractFilenameParts(filename) {
   if (!filename) return {};
 
   const withoutExt = stripExtension(filename);
-  const seasonEpisodeMatch = withoutExt.match(/\bS(\d{1,2})\s*E(\d{1,3})\b/i);
+  const seasonEpisodeMatch = withoutExt.match(/\bS\s*(\d{1,2})\s*E\s*(\d{1,3})\b/i)
+    || withoutExt.match(/\b(\d{1,2})x(\d{1,3})\b/i);
 
   let showTitle = null;
   let episodeTitle = null;
@@ -194,25 +216,19 @@ function extractFilenameParts(filename) {
       .trim();
 
     showTitle = before || null;
-
-    // Keep only the human episode title. Release/quality tags usually start
-    // at a parenthesis or at common video metadata tokens.
-    if (after) {
-      episodeTitle = after
-        .replace(/\([^)]*\)/g, ' ')
-        .replace(/\b(\d{3,4}p|x26[45]|h\.?26[45]|web[- ]?dl|webrip|bluray|hdtv|aac|av1|edge\d*)\b.*$/i, ' ')
-        .replace(/[\s\-]+$/g, '')
-        .trim() || null;
-    }
+    episodeTitle = cleanEpisodeTitle(after);
   }
 
-  return {
+  const parts = {
     filename: withoutExt,
     showTitle,
     episodeTitle,
     filenameSeason: seasonEpisodeMatch ? parseInt(seasonEpisodeMatch[1], 10) : null,
     filenameEpisode: seasonEpisodeMatch ? parseInt(seasonEpisodeMatch[2], 10) : null,
   };
+
+  logger.info(`Filename parsed: ${JSON.stringify(parts)}`);
+  return parts;
 }
 
 function searchableText(item) {
@@ -397,18 +413,21 @@ function buildSearchStrategies({ imdbId, season, episode, type, extra = {} }) {
   const strategies = [];
 
   // Keep this conservative. OpenSubtitles search quota is easy to burn.
-  // Broad/filename searches are useful, but only after the deterministic IDs.
+  // Broad/title searches are useful, but only after deterministic IDs.
   addUniqueStrategy(strategies, 'video-hash', movieHashParams(extra));
   addUniqueStrategy(strategies, 'exact-imdb', exactParams({ imdbId, season, episode, type }));
 
   if (filenameParts.showTitle && filenameParts.episodeTitle) {
+    // Do not add season_number/episode_number to the title fallback. The exact
+    // strategy already covered that. OpenSubtitles often has title matches that
+    // are not indexed under the same season mapping used by Stremio.
     addUniqueStrategy(
       strategies,
       'show-plus-episode-title-query',
-      queryParams(`${filenameParts.showTitle} ${filenameParts.episodeTitle}`, { season, episode })
+      queryParams(`${filenameParts.showTitle} ${filenameParts.episodeTitle}`)
     );
   } else if (filenameParts.episodeTitle) {
-    addUniqueStrategy(strategies, 'episode-title-query', queryParams(filenameParts.episodeTitle, { season, episode }));
+    addUniqueStrategy(strategies, 'episode-title-query', queryParams(filenameParts.episodeTitle));
   } else if (filenameParts.filename && type !== 'series') {
     // For series this is too broad and can select a completely unrelated show.
     addUniqueStrategy(strategies, 'filename-query', queryParams(filenameParts.filename));
