@@ -1,9 +1,5 @@
 'use strict';
 
-// Stremio addon definition + the subtitle resolver: parses the incoming
-// request, computes a stable cache key, checks cache/job state, and either
-// serves a ready VTT, a placeholder, or kicks off a background translation.
-
 const { addonBuilder } = require('stremio-addon-sdk');
 const logger = require('./utils/logger');
 const cacheManager = require('./services/cacheManager');
@@ -14,44 +10,72 @@ const { buildSubtitleKey } = require('./utils/hash');
 
 const manifest = {
   id: 'community.hebrew-ai-subtitles',
-  version: '0.1.0',
+  version: '0.1.1',
   name: 'Hebrew AI Subtitles',
   description: 'Personal addon that translates subtitles to Hebrew on demand using OpenAI.',
   resources: ['subtitles'],
   types: ['movie', 'series'],
   catalogs: [],
-  idPrefixes: ['tt'],
 };
 
 const builder = new addonBuilder(manifest);
 
-// Stremio video ids look like "tt1234567" (movie) or "tt1234567:1:2"
-// (series: imdbId:season:episode).
-function parseStremioId(id) {
-  const [imdbId, season, episode] = String(id).split(':');
-  return {
-    imdbId,
-    season: season !== undefined ? parseInt(season, 10) : null,
-    episode: episode !== undefined ? parseInt(episode, 10) : null,
-  };
+function parseNumber(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const parsed = parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function extractImdbId(value) {
+  if (!value) return null;
+  const match = String(value).match(/tt\d{5,}/i);
+  return match ? match[0].toLowerCase() : null;
+}
+
+function parseStremioRequest({ id, extra = {} }) {
+  const rawId = String(id || '');
+  const parts = rawId.split(':');
+
+  const imdbId =
+    extractImdbId(parts[0]) ||
+    extractImdbId(rawId) ||
+    extractImdbId(extra.imdbId) ||
+    extractImdbId(extra.imdb_id) ||
+    extractImdbId(extra.imdb);
+
+  const season = parseNumber(extra.season || extra.season_number || parts[1]);
+  const episode = parseNumber(extra.episode || extra.episode_number || parts[2]);
+
+  return { rawId, imdbId, season, episode };
+}
+
+function placeholder(kind, id) {
+  return [{ id, url: cacheManager.placeholderUrl(kind), lang: 'he' }];
 }
 
 builder.defineSubtitlesHandler(async (args) => {
-  const { type, id } = args;
-  logger.info(`Subtitle request received: type=${type} id=${id}`);
+  const { type, id, extra = {} } = args;
+  logger.info(`Subtitle request received: type=${type} id=${id} extra=${JSON.stringify(extra)}`);
 
   try {
-    const { imdbId, season, episode } = parseStremioId(id);
-    if (!imdbId || !imdbId.startsWith('tt')) {
-      logger.warn(`Ignoring request with no usable imdbId: id=${id}`);
-      return { subtitles: [] };
+    const parsed = parseStremioRequest({ id, extra });
+
+    if (!parsed.imdbId) {
+      logger.warn(`No usable IMDb id found for Stremio id=${parsed.rawId}.`);
+      return { subtitles: placeholder('unsupported-id', `unsupported-id-${encodeURIComponent(parsed.rawId || 'unknown')}`) };
     }
 
-    const subtitles = await resolveSubtitles({ type, imdbId, season, episode });
+    const subtitles = await resolveSubtitles({
+      type,
+      imdbId: parsed.imdbId,
+      season: parsed.season,
+      episode: parsed.episode,
+    });
+
     return { subtitles };
   } catch (err) {
     logger.error(`Failed to resolve subtitles for id=${id}: ${err.message}`);
-    return { subtitles: [] };
+    return { subtitles: placeholder('failed', `resolver-failed-${Date.now()}`) };
   }
 });
 
@@ -63,12 +87,12 @@ async function resolveSubtitles({ type, imdbId, season, episode }) {
     sourceSubtitle = await openSubtitlesProvider.findEnglishSubtitle({ imdbId, season, episode, type });
   } catch (err) {
     logger.error(`OpenSubtitles search failed for ${imdbId}: ${err.message}`);
-    return [];
+    return placeholder('failed', `search-failed-${imdbId}-${season || 'movie'}-${episode || ''}`);
   }
 
   if (!sourceSubtitle) {
     logger.warn(`No English subtitle source found for imdb=${imdbId} season=${season} episode=${episode}`);
-    return [];
+    return placeholder('no-source', `no-source-${imdbId}-${season || 'movie'}-${episode || ''}`);
   }
 
   const subtitleKey = buildSubtitleKey({
@@ -94,9 +118,6 @@ async function resolveSubtitles({ type, imdbId, season, episode }) {
   }
 
   if (status === 'processing') {
-    // jobs.json says "processing" but nothing is running in this process -
-    // most likely the server restarted mid-job. Fall through and restart
-    // rather than showing "processing" forever.
     logger.warn(`Found stale processing status for ${subtitleKey}, restarting job.`);
   } else if (status === 'failed') {
     logger.info(`Previous translation failed for ${subtitleKey}, serving failure placeholder`);
