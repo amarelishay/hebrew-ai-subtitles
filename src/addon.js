@@ -10,9 +10,9 @@ const { parseSrt } = require('./utils/srtParser');
 const { buildSubtitleKey } = require('./utils/hash');
 
 const manifest = {
-  id: 'community.hebrew-ai-subtitles',
-  version: '0.1.16',
-  name: 'Hebrew AI Subtitles',
+  id: 'community.hebrew-ai-subtitles-v2',
+  version: '0.2.0',
+  name: 'Hebrew AI Subtitles v2',
   description: 'Personal addon that translates subtitles to Hebrew on demand using OpenAI.',
   resources: ['subtitles'],
   types: ['movie', 'series'],
@@ -97,7 +97,7 @@ function generatedSubtitleOption({ type, id, extra }) {
 
   return {
     id: optionId,
-    name: 'Hebrew AI Subtitles - Generate Hebrew',
+    name: 'Hebrew AI Subtitles v2 - Generate Hebrew',
     url,
     lang: 'heb',
   };
