@@ -10,7 +10,7 @@ const { buildSubtitleKey } = require('./utils/hash');
 
 const manifest = {
   id: 'community.hebrew-ai-subtitles',
-  version: '0.1.6',
+  version: '0.1.7',
   name: 'Hebrew AI Subtitles',
   description: 'Personal addon that translates subtitles to Hebrew on demand using OpenAI.',
   resources: ['subtitles'],
