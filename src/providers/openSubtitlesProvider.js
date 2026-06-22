@@ -448,7 +448,7 @@ function sourceFromSortedResults(sorted, context = {}) {
 
   return {
     provider: 'opensubtitles',
-    fileId: ids[0],
+    fileId: ids.join('|'),
     candidateFileIds: ids,
     subtitleId: best.id,
     language: bestAttrs.language || context.preferredLanguage || 'unknown',
@@ -777,11 +777,11 @@ async function downloadByFileId(fileId) {
 }
 
 async function downloadSubtitleContent(sourceSubtitleOrFileId) {
-  const candidates = Array.isArray(sourceSubtitleOrFileId && sourceSubtitleOrFileId.candidateFileIds)
+  const rawCandidates = Array.isArray(sourceSubtitleOrFileId && sourceSubtitleOrFileId.candidateFileIds)
     ? sourceSubtitleOrFileId.candidateFileIds
     : [sourceSubtitleOrFileId && sourceSubtitleOrFileId.fileId ? sourceSubtitleOrFileId.fileId : sourceSubtitleOrFileId];
 
-  const ids = unique(candidates);
+  const ids = unique(rawCandidates.flatMap((value) => String(value).split('|')));
   let lastError = null;
 
   for (const fileId of ids) {
