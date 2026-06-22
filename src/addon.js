@@ -10,7 +10,7 @@ const { buildSubtitleKey } = require('./utils/hash');
 
 const manifest = {
   id: 'community.hebrew-ai-subtitles',
-  version: '0.1.2',
+  version: '0.1.3',
   name: 'Hebrew AI Subtitles',
   description: 'Personal addon that translates subtitles to Hebrew on demand using OpenAI.',
   resources: ['subtitles'],
@@ -71,10 +71,17 @@ function parseStremioRequest({ id, extra = {} }) {
 
 function generatedSubtitleOption({ type, id, extra }) {
   const safeId = encodeURIComponent(String(id || 'unknown')).slice(0, 180);
+  const url = buildGenerateUrl({ type, id, extra });
+
+  logger.info(`Generated subtitle option advertised: id=${id} url=${url}`);
+
   return {
     id: `he-ai-generate-${safeId}`,
-    url: buildGenerateUrl({ type, id, extra }),
-    lang: 'he',
+    name: 'Hebrew AI Subtitles - Generate Hebrew',
+    url,
+    // Stremio subtitle language codes are more reliable with ISO-639-2 style.
+    // Using "heb" improves compatibility versus "he" on several clients.
+    lang: 'heb',
   };
 }
 
