@@ -17,6 +17,17 @@ function isProcessing(subtitleKey) {
   return inFlight.has(subtitleKey);
 }
 
+function initialProgress(blocks) {
+  return {
+    phase: 'starting',
+    totalBlocks: blocks.length,
+    totalChunks: null,
+    translatedBlocks: 0,
+    translatedChunks: 0,
+    percent: 0,
+  };
+}
+
 // Starts a translation job in the background and returns immediately.
 // Callers should already have decided no usable cache/job exists for this key.
 async function startJob(subtitleKey, { blocks, meta }) {
@@ -26,7 +37,11 @@ async function startJob(subtitleKey, { blocks, meta }) {
   }
 
   inFlight.add(subtitleKey);
-  await cacheManager.setJobStatus(subtitleKey, 'processing', { meta, error: null });
+  await cacheManager.setJobStatus(subtitleKey, 'processing', {
+    meta,
+    error: null,
+    progress: initialProgress(blocks),
+  });
   logger.info(`Job started for ${subtitleKey} (${blocks.length} blocks)`);
 
   runJob(subtitleKey, blocks, meta)
@@ -40,7 +55,16 @@ async function startJob(subtitleKey, { blocks, meta }) {
 
 async function runJob(subtitleKey, blocks, meta) {
   try {
-    const translatedById = await translationService.translateSubtitleBlocks(blocks, { subtitleKey });
+    const translatedById = await translationService.translateSubtitleBlocks(blocks, {
+      subtitleKey,
+      onProgress: async (progress) => {
+        await cacheManager.setJobStatus(subtitleKey, 'processing', { meta, error: null, progress });
+        logger.info(
+          `Job progress for ${subtitleKey}: ${progress.percent}% ` +
+          `(${progress.translatedChunks}/${progress.totalChunks || '?'} chunks)`
+        );
+      },
+    });
 
     // Merge translated text back into the original blocks. Timestamps and
     // ids are taken from the source parse only - never from the LLM.
@@ -53,7 +77,18 @@ async function runJob(subtitleKey, blocks, meta) {
 
     const vtt = buildVtt(mergedBlocks);
     await cacheManager.saveVtt(subtitleKey, vtt);
-    await cacheManager.setJobStatus(subtitleKey, 'ready', { meta, error: null });
+    await cacheManager.setJobStatus(subtitleKey, 'ready', {
+      meta,
+      error: null,
+      progress: {
+        phase: 'ready',
+        totalBlocks: blocks.length,
+        totalChunks: null,
+        translatedBlocks: blocks.length,
+        translatedChunks: null,
+        percent: 100,
+      },
+    });
     logger.info(`Job ready for ${subtitleKey}`);
   } catch (err) {
     logger.error(`Job failed for ${subtitleKey}: ${err.message}`);
