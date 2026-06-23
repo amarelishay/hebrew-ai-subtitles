@@ -8,6 +8,7 @@ const { getRouter } = require('stremio-addon-sdk');
 
 const logger = require('./utils/logger');
 const cacheManager = require('./services/cacheManager');
+const { buildPlaceholderVtt } = require('./utils/vttBuilder');
 const { builder, manifest, decodeGeneratePayload, getGeneratedSubtitleFile } = require('./addon');
 
 function warnIfMissingEnv() {
@@ -37,7 +38,59 @@ function placeholderFile(kind) {
 
 function sendVttFile(res, filePath) {
   res.type('text/vtt');
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   return res.sendFile(filePath);
+}
+
+function sendVttContent(res, content) {
+  res.type('text/vtt');
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  return res.send(content);
+}
+
+function buildStatusMessage(job) {
+  const progress = (job && job.progress) || {};
+  const meta = (job && job.meta) || {};
+  const percent = Number.isFinite(progress.percent) ? progress.percent : 0;
+  const totalChunks = progress.totalChunks || '?';
+  const translatedChunks = progress.translatedChunks || 0;
+  const totalBlocks = progress.totalBlocks || '?';
+  const translatedBlocks = progress.translatedBlocks || 0;
+  const provider = meta.provider || 'unknown';
+  const sourceLanguage = meta.sourceLanguage || 'unknown';
+  const releaseName = meta.releaseName ? `\nמקור: ${meta.releaseName}` : '';
+
+  return [
+    '⏳ התרגום לעברית בעבודה',
+    `התקדמות: ${percent}%`,
+    `חלקים: ${translatedChunks}/${totalChunks}`,
+    `שורות: ${translatedBlocks}/${totalBlocks}`,
+    `ספק: ${provider} | שפת מקור: ${sourceLanguage}`,
+    'אפשר לבחור שוב את הכתובית בעוד כמה שניות כדי לרענן סטטוס.',
+    releaseName,
+  ].filter(Boolean).join('\n');
+}
+
+async function dynamicPlaceholderVtt(kind, subtitleKey) {
+  if (kind !== 'processing' || !subtitleKey) {
+    return null;
+  }
+
+  const job = await cacheManager.getJob(subtitleKey);
+  if (!job) {
+    return buildPlaceholderVtt('⏳ התרגום לעברית מתחיל...\nאפשר לנסות שוב בעוד כמה שניות.', 30);
+  }
+
+  if (job.status === 'ready' && cacheManager.vttExists(subtitleKey)) {
+    return null;
+  }
+
+  if (job.status === 'failed') {
+    const error = job.error ? `\nשגיאה: ${job.error}` : '';
+    return buildPlaceholderVtt(`⚠️ התרגום נכשל.${error}`, 30);
+  }
+
+  return buildPlaceholderVtt(buildStatusMessage(job), 30);
 }
 
 function shouldLogHttpRequest(req) {
@@ -123,6 +176,10 @@ app.get('/generate/:payload.vtt', async (req, res) => {
     }
 
     if (result.kind === 'placeholder') {
+      const dynamicVtt = await dynamicPlaceholderVtt(result.placeholder, result.subtitleKey);
+      if (dynamicVtt) {
+        return sendVttContent(res, dynamicVtt);
+      }
       return sendVttFile(res, placeholderFile(result.placeholder));
     }
 
