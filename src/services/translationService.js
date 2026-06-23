@@ -279,19 +279,46 @@ async function translateChunkWithRetry(chunk, chunkIndex, totalChunks, subtitleK
   );
 }
 
+function buildProgress({ blocks, chunks, translatedChunks }) {
+  const totalBlocks = blocks.length;
+  const totalChunks = chunks.length;
+  const completedChunks = Math.min(translatedChunks, totalChunks);
+  const translatedBlocks = chunks
+    .slice(0, completedChunks)
+    .reduce((sum, chunk) => sum + chunk.length, 0);
+  const percent = totalChunks === 0 ? 0 : Math.floor((completedChunks / totalChunks) * 100);
+
+  return {
+    phase: 'translating',
+    totalBlocks,
+    totalChunks,
+    translatedBlocks,
+    translatedChunks: completedChunks,
+    percent,
+  };
+}
+
 // blocks: [{ id, startMs, endMs, text }] -> Map<id, translatedText>
 // Only { id, text } ever leaves this process toward OpenAI; timestamps stay local.
-async function translateSubtitleBlocks(blocks, { subtitleKey } = {}) {
+async function translateSubtitleBlocks(blocks, { subtitleKey, onProgress } = {}) {
   const chunks = chunkBlocks(blocks);
   logger.info(
     `Translating ${blocks.length} block(s) in ${chunks.length} chunk(s) for ${subtitleKey || 'unknown'}`
   );
+
+  if (onProgress) {
+    await onProgress(buildProgress({ blocks, chunks, translatedChunks: 0 }));
+  }
 
   const resultMap = new Map();
   for (let i = 0; i < chunks.length; i += 1) {
     const items = await translateChunkWithRetry(chunks[i], i + 1, chunks.length, subtitleKey);
     for (const item of items) {
       resultMap.set(item.id, normalizeRtlSubtitleText(item.text));
+    }
+
+    if (onProgress) {
+      await onProgress(buildProgress({ blocks, chunks, translatedChunks: i + 1 }));
     }
   }
 
