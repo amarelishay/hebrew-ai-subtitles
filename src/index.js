@@ -98,6 +98,7 @@ function shouldLogHttpRequest(req) {
   return (
     url === '/' ||
     url === '/manifest.json' ||
+    url === '/v3/manifest.json' ||
     url === '/health' ||
     url.startsWith('/generate/') ||
     url.includes('/subtitles/')
@@ -151,14 +152,19 @@ app.get('/health', (req, res) => {
 //
 app.get('/', (req, res) => {
   res.send(
-    `${manifest.name} v${manifest.version} is running. Use /manifest.json to install in Stremio.`
+    `${manifest.name} v${manifest.version} is running. Use /v3/manifest.json to install in Stremio.`
   );
 });
 
 //
-// Explicit manifest route
+// Explicit manifest routes. /v3/manifest.json is intentionally a fresh install
+// URL so Stremio cannot reuse cache/state from the older /manifest.json addon.
 //
 app.get('/manifest.json', (req, res) => {
+  res.json(manifest);
+});
+
+app.get('/v3/manifest.json', (req, res) => {
   res.json(manifest);
 });
 
@@ -197,8 +203,11 @@ app.get('/generate/:payload.vtt', async (req, res) => {
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
 //
-// Stremio routes
+// Stremio routes. Keep both root and /v3 mounted: root preserves backwards
+// compatibility, /v3 matches the fresh v3 manifest install URL.
 //
+const stremioRouter = getRouter(builder.getInterface());
+app.use('/v3', stremioRouter);
 app.use(getRouter(builder.getInterface()));
 
 //
@@ -226,5 +235,6 @@ app.listen(PORT, () => {
   logger.info(`${manifest.name} v${manifest.version} listening on port ${PORT}`);
   logger.info('HTTP request diagnostics enabled for manifest, subtitles, and generate routes.');
   logger.info(`Manifest: ${PUBLIC_BASE_URL}/manifest.json`);
+  logger.info(`Fresh v3 manifest: ${PUBLIC_BASE_URL}/v3/manifest.json`);
   logger.info(`Health: ${PUBLIC_BASE_URL}/health`);
 });
